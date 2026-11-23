@@ -1,47 +1,47 @@
-"""Настройки приложения с проверкой типов.
+"""настройки приложения с проверкой типов"""
 
-Этот модуль — единое место для переменных окружения. Благодаря этому код не читает
-``os.environ`` в разных местах и не получает настройки с неверным типом незаметно.
-"""
-
-# Импорты из стандартной библиотеки Python:
-# lru_cache запоминает результат функции, а Literal ограничивает значение списком строк.
+# lru_cache сохраняет результат, Literal ограничивает список допустимых строк
 from functools import lru_cache
 from typing import Literal
 
-# BaseSettings умеет читать поля класса из APP_NAME, APP_ENV и других переменных.
-# SettingsConfigDict задаёт правила такого чтения.
+# BaseSettings читает переменные окружения, SettingsConfigDict задаёт правила
+from pydantic import PostgresDsn, RedisDsn
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-# Наследование от BaseSettings превращает обычный класс в проверяемую конфигурацию.
+# BaseSettings превращает этот класс в проверяемые настройки
 class Settings(BaseSettings):
-    """Настройки, общие для всего запущенного экземпляра приложения."""
+    """настройки приложения"""
 
-    # Аннотация ``str`` требует строку; значение справа используется по умолчанию.
-    # Из окружения его можно заменить переменной APP_NAME.
+    # имя приложения, APP_NAME в .env может его заменить
     app_name: str = "Imageboard Engine"
-    # Literal разрешает только эти три режима. Опечатка в APP_ENV даст понятную ошибку.
+    # режим работы, другие значения не пройдут проверку
     app_env: Literal["development", "test", "production"] = "development"
-    # Pydantic преобразует строки true/false из .env в настоящий логический тип bool.
+    # debug режим, строка true или false из .env станет bool
     app_debug: bool = False
 
-    # model_config — служебная настройка Pydantic, а не пользовательская переменная.
+    # адрес postgresql из DATABASE_URL в .env
+    database_url: PostgresDsn
+
+    # адрес redis из REDIS_URL в .env
+    redis_url: RedisDsn
+
+    # правила чтения настроек
     model_config = SettingsConfigDict(
-        # Сначала Pydantic прочитает локальный файл .env, если он существует.
+        # читать локальный .env, если он есть
         env_file=".env",
-        # Файл .env сохранён в UTF-8, поэтому русский текст в нём будет читаться верно.
+        # .env сохранён в utf-8
         env_file_encoding="utf-8",
-        # Лишние строки в .env игнорируются: это удобно при постепенном развитии проекта.
+        # не падать из-за лишних строк в .env
         extra="ignore",
     )
 
 
-# Декоратор начинается с @ и меняет поведение функции ниже.
-# @lru_cache означает: после первого вызова вернуть тот же объект Settings.
+# после первого вызова возвращать те же настройки
 @lru_cache
 def get_settings() -> Settings:
-    """Создать и вернуть единственный объект настроек для этого процесса."""
+    """создать настройки один раз для всего процесса"""
 
-    # Вызов класса похож на вызов функции: Settings() создаёт экземпляр и валидирует .env.
+    # Settings читает .env и проверяет типы
+    # noinspection PyArgumentList
     return Settings()
