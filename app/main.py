@@ -19,6 +19,9 @@ from app.core.database import close_postgres_pool, create_postgres_pool
 # функции для redis
 from app.core.redis import close_redis_client, create_redis_client
 
+# загрузка настроек сайта из postgresql
+from app.core.site_settings_repository import load_site_settings
+
 # получаем настройки один раз
 settings = get_settings()
 
@@ -40,6 +43,11 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
 
         # создаём пул postgresql один раз для всего приложения
         application.state.postgres_pool = await create_postgres_pool(settings)
+
+        # загружаем настройки сайта один раз при старте
+        application.state.site_settings = await load_site_settings(
+            application.state.postgres_pool
+        )
     except Exception:
         # если запуск не удался, redis клиент всё равно надо закрыть
         await close_redis_client(redis_client)
