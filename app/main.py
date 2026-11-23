@@ -1,52 +1,112 @@
-"""Точка входа ASGI-приложения.
+"""точка входа asgi приложения"""
 
-ASGI — стандарт связи между асинхронным Python-приложением и веб-сервером Uvicorn.
-Команда ``uvicorn app.main:app`` находит переменную ``app`` именно в этом модуле.
-"""
+# AsyncIterator описывает асинхронный lifecycle
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
-# Импорты сторонних библиотек: FastAPI создаёт приложение и маршруты,
-# а BaseModel описывает и проверяет структуру данных API.
-from fastapi import FastAPI
+# fastapi создаёт приложение и маршруты
+from fastapi import FastAPI, Request
+
+# BaseModel проверяет форму json ответа
 from pydantic import BaseModel
 
-# Импортируем функцию, чтобы получить настройки из одного центра.
+# читаем проверенные настройки из .env
 from app.core.config import get_settings
 
-# Скобки вызывают функцию. Результат — уже проверенный объект Settings.
+# функции для пула postgresql
+from app.core.database import close_postgres_pool, create_postgres_pool
+
+# функции для redis
+from app.core.redis import close_redis_client, create_redis_client
+
+# получаем настройки один раз
 settings = get_settings()
 
-# Создаём единственный объект FastAPI, с которым будет работать весь сайт.
+
+# lifecycle запускается вместе с приложением
+@asynccontextmanager
+async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+    """создать подключения при старте и закрыть при остановке"""
+
+    # создаём redis клиент
+    redis_client = create_redis_client(settings)
+
+    try:
+        # проверяем, что redis отвечает
+        await redis_client.ping()
+
+        # сохраняем redis клиент для маршрутов
+        application.state.redis_client = redis_client
+
+        # создаём пул postgresql один раз для всего приложения
+        application.state.postgres_pool = await create_postgres_pool(settings)
+    except Exception:
+        # если запуск не удался, redis клиент всё равно надо закрыть
+        await close_redis_client(redis_client)
+        raise
+
+    try:
+        # после yield fastapi начинает принимать запросы
+        yield
+    finally:
+        # закрываем подключения при остановке
+        await close_postgres_pool(application.state.postgres_pool)
+        await close_redis_client(application.state.redis_client)
+
+
+# главный объект fastapi
 app = FastAPI(
-    # title попадёт в заголовок интерактивной документации /docs.
+    # название в /docs
     title=settings.app_name,
-    # debug включает подробные страницы ошибок только при APP_DEBUG=true.
+
+    # подробные ошибки только в development
     debug=settings.app_debug,
-    # version — версия нашего приложения, а не версия FastAPI.
+
+    # версия нашего приложения
     version="0.1.0",
+
+    # функция запуска и остановки подключений
+    lifespan=lifespan,
 )
 
 
-# Класс описывает форму JSON-ответа для проверки состояния сервиса.
+# форма json ответа для /health
 class HealthResponse(BaseModel):
-    """Структура ответа, который возвращает маршрут проверки состояния."""
+    """ответ маршрута /health"""
 
-    # Поле status обязательно и должно быть строкой.
+    # строковый статус
     status: str
-    # Поле environment тоже обязательно и укажет текущий режим приложения.
+
+    # текущий режим приложения
     environment: str
 
 
-# @app.get — декоратор, который связывает функцию ниже с GET-запросом на /health.
-# response_model проверяет и документирует JSON-ответ, tags группирует маршрут в /docs.
+# форма json ответа для /ready
+class ReadyResponse(BaseModel):
+    """ответ маршрута /ready"""
+
+    # строковый статус
+    status: str
+
+
+# GET запрос на /health
 @app.get("/health", response_model=HealthResponse, tags=["system"])
-# async def создаёт асинхронную функцию: она не блокирует event loop ожиданием I/O.
-# ``-> HealthResponse`` сообщает тип возвращаемого значения людям, IDE и проверкам.
 async def healthcheck() -> HealthResponse:
-    """Вернуть лёгкий ответ о том, что процесс FastAPI жив.
+    """вернуть статус запущенного fastapi"""
 
-    Здесь намеренно нет обращения к PostgreSQL или Redis: это именно liveness-проверка.
-    Позже добавим отдельную readiness-проверку зависимости от внешних сервисов.
-    """
-
-    # Создаём валидируемую модель. FastAPI превратит её в JSON вида {"status": "ok", ...}.
     return HealthResponse(status="ok", environment=settings.app_env)
+
+
+# GET запрос на /ready
+@app.get("/ready", response_model=ReadyResponse, tags=["system"])
+async def readiness(request: Request) -> ReadyResponse:
+    """проверить postgresql и redis"""
+
+    # берём одно соединение из пула и делаем простой sql запрос
+    async with request.app.state.postgres_pool.acquire() as connection:
+        await connection.fetchval("SELECT 1")
+
+    # redis должен ответить PONG
+    await request.app.state.redis_client.ping()
+
+    return ReadyResponse(status="ok")

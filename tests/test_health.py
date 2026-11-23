@@ -1,30 +1,27 @@
-"""Минимальные автоматические проверки ASGI-приложения."""
+"""минимальная проверка asgi приложения"""
 
-# Сторонние библиотеки: pytest запускает тест, ASGITransport направляет запросы прямо
-# в FastAPI, а AsyncClient ведёт себя как асинхронный HTTP-клиент.
+# pytest запускает тест, httpx отправляет запрос прямо в fastapi
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-# Импортируем созданное приложение, которое будем тестировать.
+# приложение для проверки
 from app.main import app
 
 
-# Этот декоратор говорит pytest, что async-тест надо запустить через библиотеку AnyIO.
+# pytest запустит async тест через anyio
 @pytest.mark.anyio
-# async def позволяет использовать await внутри теста.
-# ``-> None`` означает, что тест не возвращает полезного значения, а только проверяет условия.
+# async def позволяет использовать await
 async def test_healthcheck_returns_application_status() -> None:
-    """Маршрут /health должен вернуть предсказуемый статус приложения."""
+    """маршрут /health возвращает ожидаемый ответ"""
 
-    # Transport перенаправляет запросы HTTPX в объект app, не открывая TCP-порт.
+    # запрос идёт в app без настоящего сетевого порта
     transport = ASGITransport(app=app)
-    # async with гарантированно закрывает клиента после блока, даже если тест упадёт.
-    # base_url — формальный адрес, необходимый HTTPX для сборки URL запроса.
+    # клиент закроется после блока
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        # await ждёт асинхронного ответа, не блокируя цикл событий.
+        # ждём ответ без блокировки event loop
         response = await client.get("/health")
 
-    # assert останавливает тест с ошибкой, если HTTP-статус отличается от успешного 200.
+    # успешный http статус
     assert response.status_code == 200
-    # response.json() превращает тело ответа из JSON в словарь Python и сравнивает его целиком.
+    # тело ответа совпадает с ожидаемым json
     assert response.json() == {"status": "ok", "environment": "development"}
