@@ -1,8 +1,12 @@
 """маршруты для тредов"""
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
-from app.api.dependencies import ThreadsServiceDependency
+from app.api.dependencies import (
+    IpBansRepositoryDependency,
+    ThreadsServiceDependency,
+    check_ip_bans,
+)
 from app.schemas.threads import PostCreate, PostSummary, ThreadWithPosts
 
 router = APIRouter(
@@ -27,11 +31,16 @@ async def get_thread(
 
 @router.post("/{thread_id}/posts", response_model=PostSummary)
 async def create_post(
+    request: Request,
     thread_id: int,
     post_create: PostCreate,
     threads_service: ThreadsServiceDependency,
+    ip_bans_repository: IpBansRepositoryDependency,
 ) -> PostSummary | None:
     """создать пост в треде"""
+
+    # забаненные IP не могут создавать посты
+    await check_ip_bans(request, ip_bans_repository)
 
     try:
         post = await threads_service.create_post(thread_id, post_create)

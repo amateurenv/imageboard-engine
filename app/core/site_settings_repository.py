@@ -4,6 +4,8 @@ import json
 from collections.abc import Sequence
 from typing import Protocol
 
+from asyncpg import Pool
+
 from app.core.site_settings import SiteSettings, get_default_site_settings
 
 
@@ -38,3 +40,18 @@ async def load_site_settings(pool: SiteSettingsPool) -> SiteSettings:
 
     # Pydantic проверит типы, лимиты и неизвестные поля
     return SiteSettings.model_validate(settings_data)
+
+
+async def save_site_settings(pool: Pool, settings: SiteSettings) -> None:
+    """сохранить все группы настроек в postgresql"""
+
+    for key, value in settings.model_dump().items():
+        await pool.execute(
+            """
+            INSERT INTO site_settings (key, value)
+            VALUES ($1, $2::jsonb)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """,
+            key,
+            json.dumps(value, ensure_ascii=False),
+        )

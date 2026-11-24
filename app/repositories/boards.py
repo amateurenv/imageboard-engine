@@ -31,6 +31,16 @@ VALUES ($1, $2, $3, $4, $5, $6)
 RETURNING {BOARD_COLUMNS}
 """
 
+LIST_ALL_BOARDS_SQL = """
+SELECT id, slug, title, description, position, is_active, is_nsfw
+FROM boards
+ORDER BY position ASC, id ASC
+"""
+
+DELETE_BOARD_SQL = """
+DELETE FROM boards WHERE slug = $1
+"""
+
 UPDATE_BOARD_SQL = f"""
 UPDATE boards
 SET title = $2, description = $3, position = $4, is_active = $5, is_nsfw = $6
@@ -128,6 +138,17 @@ class BoardsRepository:
             raise RuntimeError(f"board not created: {slug}")
 
         return _detail_record(row)
+
+    async def list_all_boards(self) -> list[BoardDetailRecord]:
+        """все доски с полными данными, включая неактивные"""
+
+        rows = await self._postgres_pool.fetch(LIST_ALL_BOARDS_SQL)
+        return [_detail_record(row) for row in rows]
+
+    async def delete_board(self, slug: str) -> None:
+        """удалить доску"""
+
+        await self._postgres_pool.execute(DELETE_BOARD_SQL, slug)
 
     async def update_board(
         self,

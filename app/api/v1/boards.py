@@ -2,9 +2,14 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
-from app.api.dependencies import PostgresPoolDependency, ThreadsServiceDependency
+from app.api.dependencies import (
+    IpBansRepositoryDependency,
+    PostgresPoolDependency,
+    ThreadsServiceDependency,
+    check_ip_bans,
+)
 from app.repositories.boards import BoardsRepository
 from app.schemas.boards import (
     BoardCreate,
@@ -102,11 +107,16 @@ async def list_threads(
 
 @router.post("/{slug}/threads", response_model=ThreadDetail)
 async def create_thread(
+    request: Request,
     slug: str,
     thread_create: ThreadCreate,
     threads_service: ThreadsServiceDependency,
+    ip_bans_repository: IpBansRepositoryDependency,
 ) -> ThreadDetail | None:
     """создать тред в доске"""
+
+    # забаненные IP не могут создавать треды
+    await check_ip_bans(request, ip_bans_repository)
 
     try:
         thread = await threads_service.create_thread(slug, thread_create)

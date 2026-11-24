@@ -90,7 +90,7 @@ class BoardsService:
     async def create_board(self, board_create: BoardCreate) -> BoardManagement:
         """создать доску и вернуть её данные"""
 
-        return await self._boards_repository.create_board(
+        board = await self._boards_repository.create_board(
             slug=board_create.slug,
             title=board_create.title,
             description=board_create.description,
@@ -98,6 +98,8 @@ class BoardsService:
             is_active=board_create.is_active,
             is_nsfw=board_create.is_nsfw,
         )
+
+        return self._to_management(board)
 
     async def update_board(self, slug: str, update: BoardUpdate) -> BoardManagement | None:
         """изменить доску, None если такая доска не найдена"""
@@ -110,4 +112,20 @@ class BoardsService:
         values = asdict(current)
         values.update(update.model_dump(exclude_none=True))
 
-        return await self._boards_repository.update_board(**values)
+        updated = await self._boards_repository.update_board(**values)
+        if updated is None:
+            return None
+
+        return self._to_management(updated)
+
+    def _to_management(self, board: BoardDetailRecord) -> BoardManagement:
+        """запись репозитория в схему ответа админки"""
+
+        return BoardManagement(
+            slug=board.slug,
+            title=board.title,
+            description=board.description,
+            position=board.position,
+            is_active=board.is_active,
+            is_nsfw=board.is_nsfw,
+        )

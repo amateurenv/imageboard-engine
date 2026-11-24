@@ -12,7 +12,24 @@
 - треды и посты: `GET /api/v1/boards/{slug}/threads` (закреплённые сверху), `POST /api/v1/boards/{slug}/threads`, `GET /api/v1/threads/{thread_id}`, `POST /api/v1/threads/{thread_id}/posts`
   - длины постов и заголовков валидируются по настройкам сайта; ссылки `>>N` сохраняются в `post_references`
   - флаги: закрепить (`is_sticky` при создании треда), закрыть (`is_locked` блокирует постинг, ответ 422)
+- авторизация: `POST /api/v1/auth/login` (bcrypt, rate limit через redis), `POST /api/v1/auth/logout`, `GET /api/v1/auth/me`
+- админка: `GET/POST /api/v1/admin/boards`, `PATCH/DELETE /api/v1/admin/boards/{slug}`, `PATCH/DELETE /api/v1/admin/threads/{id}`, `DELETE /api/v1/admin/posts/{id}`, `GET/PUT /api/v1/admin/settings`, `GET/POST/DELETE /api/v1/admin/ip_bans` (IP-баны проверяются при создании треда/поста)
+  - журнал: `moderation_log`; роли: owner/admin/moderator
+- миграция: `003_staff.sql` (users, user_sessions, moderation_log, ip_bans)
+- первый owner-админ: `scripts/seed_admin.py`
 - тесты и Ruff
+
+## Админка (Этап 4, дизайн)
+
+- Роли: владелец, администратор, модератор (владелец выше админа выше модератора)
+- Доски: `GET /api/v1/admin/boards`, `POST /api/v1/admin/boards`, `PATCH/DELETE /api/v1/admin/boards/{slug}` (title, description, position, is_active, is_nsfw)
+- Треды: `PATCH /api/v1/admin/threads/{id}` (`is_sticky`, `is_locked`, `is_archived`, `subject`), `DELETE /api/v1/admin/threads/{id}`
+- Посты: `DELETE /api/v1/admin/posts/{id}`
+- Настройки: `GET/PUT /api/v1/admin/settings` (группы: thread, post, localization)
+- Сессии: `POST /api/v1/auth/login`, `POST /api/v1/auth/logout`, `GET /api/v1/auth/me`
+- IP-баны: `GET/POST /api/v1/admin/ip_bans`, `DELETE /api/v1/admin/ip_bans/{ip}` — проверяются при создании треда/поста
+- Журнал: таблица `moderation_log` (actor, action, target_id, reason)
+- Структура: миграция `003_staff.sql` (users, user_sessions, moderation_log)
 
 ## Стек
 

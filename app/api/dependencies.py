@@ -3,12 +3,18 @@
 from typing import Annotated
 
 from asyncpg import Pool
-from fastapi import Depends, Request
+from fastapi import Depends, HTTPException, Request
 from redis.asyncio import Redis
 
+from app.core.security import SESSION_COOKIE, hash_token
 from app.core.site_settings import SiteSettings
+from app.repositories.ip_bans import IpBansRepository
 from app.repositories.threads import ThreadsRepository
+from app.repositories.users import UserRecord, UsersRepository
+from app.schemas.users import STAFF_ROLES
+from app.services.staff import StaffService
 from app.services.threads import ThreadsService
+from app.services.users import UsersService
 
 
 def get_postgres_pool(request: Request) -> Pool:
@@ -64,4 +70,97 @@ def get_threads_service(
 type ThreadsServiceDependency = Annotated[
     ThreadsService,
     Depends(get_threads_service),
+]
+
+
+def get_users_repository(postgres_pool: PostgresPoolDependency) -> UsersRepository:
+    """создать репозиторий сотрудников"""
+
+    return UsersRepository(postgres_pool)
+
+
+def get_ip_bans_repository(postgres_pool: PostgresPoolDependency) -> IpBansRepository:
+    """создать репозиторий IP-банов"""
+
+    return IpBansRepository(postgres_pool)
+
+
+def get_users_service(
+    postgres_pool: PostgresPoolDependency,
+    redis_client: RedisClientDependency,
+) -> UsersService:
+    """создать сервис авторизации"""
+
+    return UsersService(UsersRepository(postgres_pool), redis_client)
+
+
+type UsersServiceDependency = Annotated[
+    UsersService,
+    Depends(get_users_service),
+]
+
+
+def get_staff_service(postgres_pool: PostgresPoolDependency) -> StaffService:
+    """создать сервис администрирования"""
+
+    return StaffService(postgres_pool)
+
+
+type StaffServiceDependency = Annotated[
+    StaffService,
+    Depends(get_staff_service),
+]
+
+
+async def get_current_user(request: Request) -> UserRecord:
+    """вернуть сотрудника по сессионному токену из cookie"""
+
+    token = request.cookies.get(SESSION_COOKIE)
+    if token is None:
+        raise HTTPException(status_code=401, detail="not authorized")
+
+    user = await UsersRepository(request.app.state.postgres_pool).get_user_by_session(
+        hash_token(token)
+    )
+    if user is None:
+        raise HTTPException(status_code=401, detail="invalid session")
+
+    return user
+
+
+type CurrentUserDependency = Annotated[
+    UserRecord,
+    Depends(get_current_user),
+]
+
+
+async def get_current_staff_user(user: CurrentUserDependency) -> UserRecord:
+    """вернуть сотрудника, имеющего роль сотрудника"""
+
+    if user.role not in STAFF_ROLES:
+        raise HTTPException(status_code=403, detail="staff access required")
+
+    return user
+
+
+type StaffUserDependency = Annotated[
+    UserRecord,
+    Depends(get_current_staff_user),
+]
+
+
+async def check_ip_bans(
+    request: Request,
+    ip_bans_repository: Annotated[IpBansRepository, Depends(get_ip_bans_repository)],
+) -> None:
+    """забаненные IP не могут публиковать треды и посты"""
+
+    ip = request.client.host
+    if ip is not None and await ip_bans_repository.get_by_ip(ip) is not None:
+        raise HTTPException(status_code=403, detail="ip is banned")
+
+
+type IpBansRepositoryDependency = Annotated[
+    IpBansRepository,
+    Depends(get_ip_bans_repository),
 ]

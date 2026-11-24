@@ -37,6 +37,13 @@ VALUES ($1, $2, $3)
 RETURNING id, subject, is_sticky, is_locked, is_archived, created_at, bumped_at
 """
 
+UPDATE_THREAD_SQL = """
+UPDATE threads
+SET subject = $2, is_sticky = $3, is_locked = $4, is_archived = $5
+WHERE id = $1
+RETURNING id, subject, is_sticky, is_locked, is_archived, created_at, bumped_at
+"""
+
 CREATE_POST_SQL = """
 INSERT INTO posts (thread_id, author_name, body)
 VALUES ($1, $2, $3)
@@ -179,13 +186,34 @@ class ThreadsRepository:
                                 target_id,
                             )
 
-        if post_row is None:
-            # insert без ошибки всегда возвращает строку
-            raise RuntimeError(f"post not created in thread: {thread_id}")
+    async def update_thread(
+        self,
+        *,
+        thread_id: int,
+        subject: str,
+        is_sticky: bool,
+        is_locked: bool,
+        is_archived: bool,
+    ) -> ThreadRecord | None:
+        """изменить тред"""
 
-        return PostRecord(
-            id=post_row["id"],
-            author_name=author_name,
-            body=body,
-            created_at=post_row["created_at"],
+        row = await self._postgres_pool.fetchrow(
+            UPDATE_THREAD_SQL, thread_id, subject, is_sticky, is_locked, is_archived
         )
+        return None if row is None else _thread_record(row)
+
+    async def delete_thread(self, thread_id: int) -> bool:
+        """удалить тред, вернуть есть ли такой"""
+
+        row = await self._postgres_pool.fetchrow(
+            "DELETE FROM threads WHERE id = $1 RETURNING id", thread_id
+        )
+        return row is not None
+
+    async def delete_post(self, post_id: int) -> bool:
+        """удалить пост, вернуть есть ли такой"""
+
+        row = await self._postgres_pool.fetchrow(
+            "DELETE FROM posts WHERE id = $1 RETURNING id", post_id
+        )
+        return row is not None
