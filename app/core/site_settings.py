@@ -61,6 +61,46 @@ class AppearanceSettings(BaseModel):
         pattern=r"^[a-z0-9_-]+$",
     )
 
+    # путь к логотипу относительно media/, например originals/abc.png
+    logo_path: str | None = Field(
+        default=None,
+        max_length=200,
+        pattern=r"^[a-z0-9][a-z0-9_.-]*(/[a-z0-9][a-z0-9_.-]*)*$",
+    )
+
+    # путь к файлу favicon
+    favicon_path: str | None = Field(
+        default=None,
+        max_length=200,
+        pattern=r"^[a-z0-9][a-z0-9_.-]*(/[a-z0-9][a-z0-9_.-]*)*$",
+    )
+
+    # путь к фоновому изображению сайта
+    background_path: str | None = Field(
+        default=None,
+        max_length=200,
+        pattern=r"^[a-z0-9][a-z0-9_.-]*(/[a-z0-9][a-z0-9_.-]*)*$",
+    )
+
+    # CSS-переменные стилей (пары «имя: значение»)
+    style_vars: dict[str, str] = Field(default_factory=dict)
+
+
+# настройки названия сайта, описания и правил
+class SiteInfoSettings(BaseModel):
+    """Название сайта, описание, правила (группа site)"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # название сайта, показывается в интерфейсе
+    title: str = Field(default="Imageboard Engine", min_length=1, max_length=200)
+
+    # краткое описание, показывается в каталоге и поиске
+    description: str = Field(default="", max_length=1000)
+
+    # правила сайта, показываются в интерфейсе
+    rules: str = Field(default="", max_length=5000)
+
 
 # все настройки одного сайта
 class SiteSettings(BaseModel):
@@ -73,6 +113,7 @@ class SiteSettings(BaseModel):
     post: PostSettings = Field(default_factory=PostSettings)
     localization: LocalizationSettings = Field(default_factory=LocalizationSettings)
     appearance: AppearanceSettings = Field(default_factory=AppearanceSettings)
+    site: SiteInfoSettings = Field(default_factory=SiteInfoSettings)
 
 
 def get_default_site_settings() -> SiteSettings:

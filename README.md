@@ -19,6 +19,7 @@
 - первый owner-админ: `scripts/seed_admin.py`
 - защита от спама (Этап 5): rate limit создания тредов (3/сутки на доску) и постов (10/час в тред) через redis
 - медиа (Этап 6): `POST /api/v1/media` — загрузка файлов (картинки, видео, голосовые/файлы/музыка), оригиналы в `media/originals/`
+- кастомизация сайта (Этап 7): `GET/PUT /api/v1/admin/settings` — группы: `site` (title, description, rules), расширенная `appearance` (logo_path, favicon_path, background_path, style_vars)
 - тесты и Ruff
 
 ## Админка (Этап 4, дизайн)
