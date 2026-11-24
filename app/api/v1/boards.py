@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from app.api.dependencies import (
     IpBansRepositoryDependency,
     PostgresPoolDependency,
+    SpamServiceDependency,
     ThreadsServiceDependency,
     check_ip_bans,
 )
@@ -112,11 +113,15 @@ async def create_thread(
     thread_create: ThreadCreate,
     threads_service: ThreadsServiceDependency,
     ip_bans_repository: IpBansRepositoryDependency,
+    spam_service: SpamServiceDependency,
 ) -> ThreadDetail | None:
     """создать тред в доске"""
 
     # забаненные IP не могут создавать треды
     await check_ip_bans(request, ip_bans_repository)
+
+    # rate limit создания тредов на доску
+    await spam_service.check_thread_limit(slug)
 
     try:
         thread = await threads_service.create_thread(slug, thread_create)

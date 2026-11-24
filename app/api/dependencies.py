@@ -12,6 +12,7 @@ from app.repositories.ip_bans import IpBansRepository
 from app.repositories.threads import ThreadsRepository
 from app.repositories.users import UserRecord, UsersRepository
 from app.schemas.users import STAFF_ROLES
+from app.services.spam import SpamService
 from app.services.staff import StaffService
 from app.services.threads import ThreadsService
 from app.services.users import UsersService
@@ -163,4 +164,16 @@ async def check_ip_bans(
 type IpBansRepositoryDependency = Annotated[
     IpBansRepository,
     Depends(get_ip_bans_repository),
+]
+
+
+def get_spam_service(redis_client: RedisClientDependency) -> SpamService:
+    """создать сервис защиты от спама"""
+
+    return SpamService(redis_client)
+
+
+type SpamServiceDependency = Annotated[
+    SpamService,
+    Depends(get_spam_service),
 ]

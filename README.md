@@ -17,6 +17,7 @@
   - журнал: `moderation_log`; роли: owner/admin/moderator
 - миграция: `003_staff.sql` (users, user_sessions, moderation_log, ip_bans)
 - первый owner-админ: `scripts/seed_admin.py`
+- защита от спама (Этап 5): rate limit создания тредов (3/сутки на доску) и постов (10/час в тред) через redis
 - тесты и Ruff
 
 ## Админка (Этап 4, дизайн)

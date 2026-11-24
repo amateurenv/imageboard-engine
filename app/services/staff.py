@@ -9,7 +9,7 @@ from app.core.site_settings_repository import save_site_settings
 from app.repositories.boards import BoardDetailRecord, BoardsRepository
 from app.repositories.threads import ThreadsRepository
 from app.repositories.users import UsersRepository
-from app.schemas.boards import BoardManagement
+from app.schemas.boards import BoardCreate, BoardManagement, BoardUpdate
 from app.schemas.staff import ThreadUpdateAdmin
 from app.schemas.threads import ThreadDetail
 
@@ -49,6 +49,39 @@ class StaffService:
             actor_id, "delete_board", "board", board.id, reason=f"board deleted: {slug}"
         )
         return True
+
+    async def create_board(self, board_create: BoardCreate) -> BoardManagement:
+        """создать доску и вернуть её данные"""
+
+        board = await self._boards_repository.create_board(
+            slug=board_create.slug,
+            title=board_create.title,
+            description=board_create.description,
+            position=board_create.position,
+            is_active=board_create.is_active,
+            is_nsfw=board_create.is_nsfw,
+        )
+
+        return self._to_management(board)
+
+    async def update_board(
+        self, slug: str, board_update: BoardUpdate
+    ) -> BoardManagement | None:
+        """изменить доску, None если такая доска не найдена"""
+
+        current = await self._boards_repository.get_by_slug(slug)
+        if current is None:
+            return None
+
+        # None в запросе значит «не менять», мержим с текущими значениями
+        values = asdict(current)
+        values.update(board_update.model_dump(exclude_none=True))
+
+        updated = await self._boards_repository.update_board(**values)
+        if updated is None:
+            return None
+
+        return self._to_management(updated)
 
     async def update_thread(
         self, thread_id: int, update: ThreadUpdateAdmin

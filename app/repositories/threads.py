@@ -186,6 +186,13 @@ class ThreadsRepository:
                                 target_id,
                             )
 
+        return PostRecord(
+            id=post_row["id"],
+            author_name=author_name,
+            body=body,
+            created_at=post_row["created_at"],
+        )
+
     async def update_thread(
         self,
         *,

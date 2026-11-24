@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from app.api.dependencies import (
     IpBansRepositoryDependency,
+    SpamServiceDependency,
     ThreadsServiceDependency,
     check_ip_bans,
 )
@@ -36,11 +37,15 @@ async def create_post(
     post_create: PostCreate,
     threads_service: ThreadsServiceDependency,
     ip_bans_repository: IpBansRepositoryDependency,
+    spam_service: SpamServiceDependency,
 ) -> PostSummary | None:
     """создать пост в треде"""
 
     # забаненные IP не могут создавать посты
     await check_ip_bans(request, ip_bans_repository)
+
+    # rate limit постинга в тред
+    await spam_service.check_post_limit(thread_id)
 
     try:
         post = await threads_service.create_post(thread_id, post_create)
