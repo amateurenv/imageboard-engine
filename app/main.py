@@ -1,5 +1,6 @@
 """точка входа asgi приложения"""
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -11,6 +12,7 @@ from app.core.config import get_settings
 from app.core.database import close_postgres_pool, create_postgres_pool
 from app.core.redis import close_redis_client, create_redis_client
 from app.core.site_settings_repository import load_site_settings
+from app.ws.manager import WebSocketManager
 
 # получаем проверенные настройки один раз для всего процесса
 settings = get_settings()
@@ -41,10 +43,17 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         await close_redis_client(redis_client)
         raise
 
+    # websocket-менеджер и задача потребления событий из redis
+    ws_manager = WebSocketManager(redis_client)
+    application.state.ws_manager = ws_manager
+    ws_consumer = asyncio.create_task(ws_manager.consume_redis())
+
     try:
         # после yield fastapi начинает принимать запросы
         yield
     finally:
+        # останавливаем потребление redis-событий
+        ws_consumer.cancel()
         # закрываем подключения при штатной остановке или Ctrl+C
         await close_postgres_pool(application.state.postgres_pool)
         await close_redis_client(application.state.redis_client)

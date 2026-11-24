@@ -5,6 +5,7 @@ from typing import Annotated
 from asyncpg import Pool
 from fastapi import Depends, HTTPException, Request
 from redis.asyncio import Redis
+from starlette.requests import HTTPConnection
 
 from app.core.security import SESSION_COOKIE, hash_token
 from app.core.site_settings import SiteSettings
@@ -18,6 +19,7 @@ from app.services.spam import SpamService
 from app.services.staff import StaffService
 from app.services.threads import ThreadsService
 from app.services.users import UsersService
+from app.ws.manager import WebSocketManager
 
 
 def get_postgres_pool(request: Request) -> Pool:
@@ -58,16 +60,29 @@ type SiteSettingsDependency = Annotated[
 ]
 
 
+def get_ws_manager(connection: HTTPConnection) -> WebSocketManager:
+    """вернуть websocket-менеджер приложения (работает и для HTTP, и для WS)"""
+
+    return connection.app.state.ws_manager
+
+
+type WsManagerDependency = Annotated[
+    WebSocketManager,
+    Depends(get_ws_manager),
+]
+
+
 def get_threads_service(
     postgres_pool: PostgresPoolDependency,
     site_settings: SiteSettingsDependency,
+    ws_manager: WsManagerDependency,
 ) -> ThreadsService:
     """создать service для одного http-запроса"""
 
     # эти объекты лёгкие и не создают новое подключение к postgresql
     repository = ThreadsRepository(postgres_pool)
 
-    return ThreadsService(repository, site_settings)
+    return ThreadsService(repository, site_settings, ws_manager)
 
 
 type ThreadsServiceDependency = Annotated[

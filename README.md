@@ -20,6 +20,7 @@
 - защита от спама (Этап 5): rate limit создания тредов (3/сутки на доску) и постов (10/час в тред) через redis
 - медиа (Этап 6): `POST /api/v1/media` — загрузка файлов (картинки, видео, голосовые/файлы/музыка), оригиналы в `media/originals/`
 - кастомизация сайта (Этап 7): `GET/PUT /api/v1/admin/settings` — группы: `site` (title, description, rules), расширенная `appearance` (logo_path, favicon_path, background_path, style_vars)
+- realtime (Этап 8): `WS /api/v1/ws` — события `post_created` (`thread_id`, `post`) и `thread_bumped` (`thread_id`), транслируются через Redis pub/sub (канал `ws:events`), работает между процессами
 - тесты и Ruff
 
 ## Админка (Этап 4, дизайн)
@@ -94,7 +95,7 @@ uvicorn app.main:app --reload
 4. Защита от спама и staff-аккаунты
 5. Админ-панель
 6. Загрузка медиа и превью
-7. WebSocket-обновления и Telegram-бот
+7. WebSocket-обновления (realtime) — выполнено; Telegram-бот — далее.
 8. Темы и настройка внешнего вида
 
 ## Принципы

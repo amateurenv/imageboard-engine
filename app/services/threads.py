@@ -12,6 +12,7 @@ from app.schemas.threads import (
     ThreadSummary,
     ThreadWithPosts,
 )
+from app.ws.manager import WebSocketManager
 
 # паттерн ссылок на посты: >>123
 POST_REFERENCE_PATTERN = re.compile(r">>(\d+)")
@@ -20,10 +21,16 @@ POST_REFERENCE_PATTERN = re.compile(r">>(\d+)")
 class ThreadsService:
     """подготовка данных тредов и постов для публичного api"""
 
-    def __init__(self, repository: ThreadsRepository, site_settings: SiteSettings) -> None:
-        # сервис получает репозиторий и проверенные настройки сайта
+    def __init__(
+        self,
+        repository: ThreadsRepository,
+        site_settings: SiteSettings,
+        ws_manager: WebSocketManager,
+    ) -> None:
+        # сервис получает репозиторий, настройки сайта и менеджер realtime-событий
         self._repository = repository
         self._site_settings = site_settings
+        self._ws_manager = ws_manager
 
     async def list_threads(self, board_slug: str) -> list[ThreadSummary] | None:
         """список тредов доски, None если доски нет"""
@@ -98,7 +105,18 @@ class ThreadsService:
             reference_ids=reference_ids,
         )
 
-        return self._to_post_summary(post)
+        # транслируем realtime-события: новый пост и поднятие треда
+        post_summary = self._to_post_summary(post)
+        await self._ws_manager.broadcast(
+            {
+                "event": "post_created",
+                "thread_id": thread_id,
+                "post": post_summary.model_dump(mode="json"),
+            }
+        )
+        await self._ws_manager.broadcast({"event": "thread_bumped", "thread_id": thread_id})
+
+        return post_summary
 
     def _check_subject_length(self, subject: str) -> None:
         """проверить длину заголовка по thread.max_subject_length"""
