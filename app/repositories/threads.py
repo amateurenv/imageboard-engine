@@ -32,8 +32,8 @@ ORDER BY id ASC
 """
 
 CREATE_THREAD_SQL = """
-INSERT INTO threads (board_id, subject)
-VALUES ($1, $2)
+INSERT INTO threads (board_id, subject, is_sticky)
+VALUES ($1, $2, $3)
 RETURNING id, subject, is_sticky, is_locked, is_archived, created_at, bumped_at
 """
 
@@ -130,10 +130,14 @@ class ThreadsRepository:
             for row in rows
         ]
 
-    async def create_thread(self, *, board_id: int, subject: str) -> ThreadRecord:
+    async def create_thread(
+        self, *, board_id: int, subject: str, is_sticky: bool
+    ) -> ThreadRecord:
         """создать тред"""
 
-        row = await self._postgres_pool.fetchrow(CREATE_THREAD_SQL, board_id, subject)
+        row = await self._postgres_pool.fetchrow(
+            CREATE_THREAD_SQL, board_id, subject, is_sticky
+        )
         if row is None:
             # insert без ошибки всегда возвращает строку
             raise RuntimeError(f"thread not created: board_id={board_id}")
@@ -154,7 +158,12 @@ class ThreadsRepository:
                 post_row = await connection.fetchrow(
                     CREATE_POST_SQL, thread_id, author_name, body
                 )
-                await connection.execute(BUMP_THREAD_SQL, thread_id)
+                # архивный тред не поднимается новыми ответами
+                is_archived = await connection.fetchval(
+                    "SELECT is_archived FROM threads WHERE id = $1", thread_id
+                )
+                if not is_archived:
+                    await connection.execute(BUMP_THREAD_SQL, thread_id)
                 if reference_ids:
                     # ссылки ведём только на посты, которые уже есть в базе
                     existing_rows = await connection.fetch(

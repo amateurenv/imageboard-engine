@@ -70,6 +70,7 @@ class ThreadsService:
         thread = await self._repository.create_thread(
             board_id=board_id,
             subject=thread_create.subject,
+            is_sticky=thread_create.is_sticky,
         )
 
         return self._to_detail(thread)
@@ -79,8 +80,11 @@ class ThreadsService:
     ) -> PostSummary | None:
         """создать пост в треде: вставка, бамп треда, ссылки >>N"""
 
-        if await self._repository.get_thread(thread_id) is None:
+        thread = await self._repository.get_thread(thread_id)
+        if thread is None:
             return None
+        if thread.is_locked:
+            raise ValueError("thread is locked")
 
         self._check_post_length(post_create.body)
         self._check_author_name(post_create.author_name)

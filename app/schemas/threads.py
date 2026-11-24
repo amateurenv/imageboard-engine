@@ -55,6 +55,9 @@ class ThreadCreate(BaseModel):
     # заголовок треда, пустой допустим
     subject: str = Field(default="", max_length=1000)
 
+    # закреплённый тред всегда выше обычных в списке
+    is_sticky: bool = False
+
 
 class PostCreate(BaseModel):
     """создать пост в треде (данные из запроса)"""

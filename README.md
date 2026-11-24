@@ -8,7 +8,10 @@
 - `/health` показывает, что приложение запущено, а `/ready` проверяет PostgreSQL и Redis
 - SQL-миграции с проверкой контрольных сумм
 - настройки сайта хранятся в БД и проверяются через Pydantic
-- `GET /api/v1/boards` отдаёт список активных досок
+- доски: `GET /api/v1/boards`, `GET /api/v1/boards/{slug}`, `POST /api/v1/boards`, `PATCH /api/v1/boards/{slug}`
+- треды и посты: `GET /api/v1/boards/{slug}/threads` (закреплённые сверху), `POST /api/v1/boards/{slug}/threads`, `GET /api/v1/threads/{thread_id}`, `POST /api/v1/threads/{thread_id}/posts`
+  - длины постов и заголовков валидируются по настройкам сайта; ссылки `>>N` сохраняются в `post_references`
+  - флаги: закрепить (`is_sticky` при создании треда), закрыть (`is_locked` блокирует постинг, ответ 422)
 - тесты и Ruff
 
 ## Стек
