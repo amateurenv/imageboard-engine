@@ -4,7 +4,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from app.api.dependencies import PostgresPoolDependency
+from app.api.dependencies import PostgresPoolDependency, ThreadsServiceDependency
 from app.repositories.boards import BoardsRepository
 from app.schemas.boards import (
     BoardCreate,
@@ -13,6 +13,7 @@ from app.schemas.boards import (
     BoardSummary,
     BoardUpdate,
 )
+from app.schemas.threads import ThreadCreate, ThreadDetail, ThreadListResponse
 from app.services.boards import BoardsService
 
 # все маршруты этого модуля начинаются с /boards
@@ -83,3 +84,36 @@ async def update_board(
         raise HTTPException(status_code=404, detail="board not found")
 
     return updated
+
+
+@router.get("/{slug}/threads", response_model=ThreadListResponse)
+async def list_threads(
+    slug: str,
+    threads_service: ThreadsServiceDependency,
+) -> ThreadListResponse | None:
+    """список тредов доски"""
+
+    threads = await threads_service.list_threads(slug)
+    if threads is None:
+        raise HTTPException(status_code=404, detail="board not found")
+
+    return ThreadListResponse(items=threads)
+
+
+@router.post("/{slug}/threads", response_model=ThreadDetail)
+async def create_thread(
+    slug: str,
+    thread_create: ThreadCreate,
+    threads_service: ThreadsServiceDependency,
+) -> ThreadDetail | None:
+    """создать тред в доске"""
+
+    try:
+        thread = await threads_service.create_thread(slug, thread_create)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    if thread is None:
+        raise HTTPException(status_code=404, detail="board not found")
+
+    return thread
