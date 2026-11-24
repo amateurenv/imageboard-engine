@@ -9,9 +9,11 @@ from redis.asyncio import Redis
 from app.core.security import SESSION_COOKIE, hash_token
 from app.core.site_settings import SiteSettings
 from app.repositories.ip_bans import IpBansRepository
+from app.repositories.media import MediaRepository
 from app.repositories.threads import ThreadsRepository
 from app.repositories.users import UserRecord, UsersRepository
 from app.schemas.users import STAFF_ROLES
+from app.services.media import MediaService
 from app.services.spam import SpamService
 from app.services.staff import StaffService
 from app.services.threads import ThreadsService
@@ -176,4 +178,19 @@ def get_spam_service(redis_client: RedisClientDependency) -> SpamService:
 type SpamServiceDependency = Annotated[
     SpamService,
     Depends(get_spam_service),
+]
+
+
+def get_media_service(
+    postgres_pool: PostgresPoolDependency,
+    redis_client: RedisClientDependency,
+) -> MediaService:
+    """создать сервис загрузки медиа"""
+
+    return MediaService(MediaRepository(postgres_pool), redis_client)
+
+
+type MediaServiceDependency = Annotated[
+    MediaService,
+    Depends(get_media_service),
 ]
