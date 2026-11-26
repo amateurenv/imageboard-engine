@@ -5,13 +5,22 @@ from datetime import datetime
 
 from asyncpg import Pool, Record
 
-# треды доски: закреплённые выше обычных, остальные — по последнему ответу
-LIST_THREADS_SQL = """
+# треды доски: закреплённые выше обычных, остальные - по последнему ответу
+LIST_THREADS_PAGE_SQL = """
 SELECT id, subject, is_sticky, is_locked, is_archived, created_at, bumped_at
 FROM threads
 WHERE board_id = $1
     AND is_archived = FALSE
+    AND (
+        $2::boolean IS NULL
+        OR is_sticky < $2
+        OR (
+            is_sticky = $2
+            AND (bumped_at, id) < ($3::timestamptz, $4::bigint)
+        )
+    )
 ORDER BY is_sticky DESC, bumped_at DESC, id DESC
+LIMIT $5
 """
 
 GET_BOARD_ID_BY_SLUG_SQL = """
@@ -21,16 +30,28 @@ WHERE slug = $1 AND is_active = TRUE
 """
 
 GET_THREAD_SQL = """
-SELECT id, subject, is_sticky, is_locked, is_archived, created_at, bumped_at
-FROM threads
-WHERE id = $1
+SELECT t.id, t.subject, t.is_sticky, t.is_locked, t.is_archived, t.created_at, t.bumped_at
+FROM threads AS t
+JOIN boards AS b ON b.id = t.board_id
+WHERE t.id = $1 AND b.is_active = TRUE
 """
 
-GET_THREAD_POSTS_SQL = """
+GET_THREAD_OP_SQL = """
 SELECT id, author_name, body, created_at
 FROM posts
 WHERE thread_id = $1
 ORDER BY id ASC
+LIMIT 1
+"""
+
+GET_THREAD_REPLIES_PAGE_SQL = """
+SELECT id, author_name, body, created_at
+FROM posts
+WHERE thread_id = $1
+    AND id > $2
+    AND ($3::bigint IS NULL OR id < $3)
+ORDER BY id DESC
+LIMIT $4
 """
 
 CREATE_THREAD_SQL = """
@@ -109,6 +130,15 @@ class ThreadCreationResult:
     post: PostRecord
 
 
+@dataclass(frozen=True, slots=True)
+class ThreadPageRecord:
+    """тред, OP и ответы одной страницы из postgresql"""
+
+    thread: ThreadRecord
+    op: PostRecord | None
+    replies: list[PostRecord]
+
+
 def _thread_record(row: Record) -> ThreadRecord:
     """превратить строку базы в запись треда"""
 
@@ -120,6 +150,17 @@ def _thread_record(row: Record) -> ThreadRecord:
         is_archived=row["is_archived"],
         created_at=row["created_at"],
         bumped_at=row["bumped_at"],
+    )
+
+
+def _post_record(row: Record) -> PostRecord:
+    """превратить строку базы в запись поста"""
+
+    return PostRecord(
+        id=row["id"],
+        author_name=row["author_name"],
+        body=row["body"],
+        created_at=row["created_at"],
     )
 
 
@@ -136,10 +177,25 @@ class ThreadsRepository:
         row = await self._postgres_pool.fetchrow(GET_BOARD_ID_BY_SLUG_SQL, slug)
         return None if row is None else row["id"]
 
-    async def list_threads(self, board_id: int) -> list[ThreadRecord]:
-        """список тредов доски: закреплённые выше"""
+    async def list_threads_page(
+        self,
+        *,
+        board_id: int,
+        cursor_sticky: bool | None,
+        cursor_bumped_at: datetime | None,
+        cursor_id: int | None,
+        limit: int,
+    ) -> list[ThreadRecord]:
+        """вернуть страницу тредов в порядке показа"""
 
-        rows = await self._postgres_pool.fetch(LIST_THREADS_SQL, board_id)
+        rows = await self._postgres_pool.fetch(
+            LIST_THREADS_PAGE_SQL,
+            board_id,
+            cursor_sticky,
+            cursor_bumped_at,
+            cursor_id,
+            limit + 1,
+        )
         return [_thread_record(row) for row in rows]
 
     async def get_thread(self, thread_id: int) -> ThreadRecord | None:
@@ -148,19 +204,40 @@ class ThreadsRepository:
         row = await self._postgres_pool.fetchrow(GET_THREAD_SQL, thread_id)
         return None if row is None else _thread_record(row)
 
-    async def get_posts(self, thread_id: int) -> list[PostRecord]:
-        """все посты треда по порядку"""
+    async def get_thread_page(
+        self,
+        *,
+        thread_id: int,
+        before_id: int | None,
+        limit: int,
+    ) -> ThreadPageRecord | None:
+        """вернуть OP и страницу последних или более старых ответов"""
 
-        rows = await self._postgres_pool.fetch(GET_THREAD_POSTS_SQL, thread_id)
-        return [
-            PostRecord(
-                id=row["id"],
-                author_name=row["author_name"],
-                body=row["body"],
-                created_at=row["created_at"],
-            )
-            for row in rows
-        ]
+        # один снимок чтения не даст вернуть удалённый тред с чужими постами
+        async with self._postgres_pool.acquire() as connection:
+            async with connection.transaction(isolation="repeatable_read", readonly=True):
+                thread_row = await connection.fetchrow(GET_THREAD_SQL, thread_id)
+                if thread_row is None:
+                    return None
+
+                op_row = await connection.fetchrow(GET_THREAD_OP_SQL, thread_id)
+                op = None if op_row is None else _post_record(op_row)
+
+                # первый пост не должен повторяться среди ответов
+                op_id = 0 if op is None else op.id
+                reply_rows = await connection.fetch(
+                    GET_THREAD_REPLIES_PAGE_SQL,
+                    thread_id,
+                    op_id,
+                    before_id,
+                    limit + 1,
+                )
+
+        return ThreadPageRecord(
+            thread=_thread_record(thread_row),
+            op=op,
+            replies=[_post_record(row) for row in reply_rows],
+        )
 
     async def create_thread(
         self,

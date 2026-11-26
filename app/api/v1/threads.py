@@ -1,6 +1,6 @@
 """маршруты для тредов"""
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.api.dependencies import (
     IpBansRepositoryDependency,
@@ -9,7 +9,8 @@ from app.api.dependencies import (
     check_ip_bans,
     get_client_ip,
 )
-from app.schemas.threads import PostCreate, PostSummary, ThreadWithPosts
+from app.core.pagination import decode_post_cursor
+from app.schemas.threads import PostCreate, PostSummary, ThreadPageResponse
 
 router = APIRouter(
     prefix="/threads",
@@ -17,14 +18,25 @@ router = APIRouter(
 )
 
 
-@router.get("/{thread_id}", response_model=ThreadWithPosts)
+@router.get("/{thread_id}", response_model=ThreadPageResponse)
 async def get_thread(
     thread_id: int,
     threads_service: ThreadsServiceDependency,
-) -> ThreadWithPosts | None:
-    """тред и все его посты по порядку"""
+    limit: int = Query(
+        default=100,
+        ge=1,
+        le=100,
+        description="число ответов на странице",
+    ),
+    cursor: str | None = Query(
+        default=None,
+        description="cursor из предыдущего ответа",
+    ),
+) -> ThreadPageResponse | None:
+    """OP и страница последних или более старых ответов"""
 
-    thread = await threads_service.get_thread(thread_id)
+    post_cursor = decode_post_cursor(cursor, thread_id)
+    thread = await threads_service.get_thread(thread_id, post_cursor, limit)
     if thread is None:
         raise HTTPException(status_code=404, detail="thread not found")
 

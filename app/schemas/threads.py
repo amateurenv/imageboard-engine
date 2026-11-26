@@ -19,6 +19,9 @@ class ThreadListResponse(BaseModel):
 
     items: list[ThreadSummary] = Field(default_factory=list)
 
+    # null значит, что следующей страницы больше нет
+    next_cursor: str | None = None
+
 
 class ThreadDetail(BaseModel):
     """данные треда"""
@@ -43,10 +46,25 @@ class PostSummary(BaseModel):
 
 
 class ThreadWithPosts(BaseModel):
-    """тред и все его посты по порядку"""
+    """новый тред и его первый пост"""
 
     thread: ThreadDetail
     posts: list[PostSummary]
+
+
+class ThreadPageResponse(BaseModel):
+    """страница треда с OP и частью ответов"""
+
+    thread: ThreadDetail
+
+    # у старого пустого треда может не быть поста
+    op: PostSummary | None
+
+    # ответы идут по времени от старого к новому
+    replies: list[PostSummary] = Field(default_factory=list)
+
+    # cursor для более старых ответов, null если они закончились
+    next_cursor: str | None = None
 
 
 class ThreadCreate(BaseModel):

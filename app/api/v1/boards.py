@@ -2,7 +2,7 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from app.api.dependencies import (
     IpBansRepositoryDependency,
@@ -12,6 +12,7 @@ from app.api.dependencies import (
     check_ip_bans,
     get_client_ip,
 )
+from app.core.pagination import decode_thread_cursor
 from app.repositories.boards import BoardsRepository
 from app.schemas.boards import BoardListResponse, BoardSummary
 from app.schemas.threads import ThreadCreate, ThreadListResponse, ThreadWithPosts
@@ -66,14 +67,25 @@ async def get_board(
 async def list_threads(
     slug: str,
     threads_service: ThreadsServiceDependency,
+    limit: int = Query(
+        default=30,
+        ge=1,
+        le=100,
+        description="число тредов на странице",
+    ),
+    cursor: str | None = Query(
+        default=None,
+        description="cursor из предыдущего ответа",
+    ),
 ) -> ThreadListResponse | None:
-    """список тредов доски"""
+    """страница тредов доски"""
 
-    threads = await threads_service.list_threads(slug)
-    if threads is None:
+    thread_cursor = decode_thread_cursor(cursor, slug)
+    response = await threads_service.list_threads(slug, thread_cursor, limit)
+    if response is None:
         raise HTTPException(status_code=404, detail="board not found")
 
-    return ThreadListResponse(items=threads)
+    return response
 
 
 @router.post("/{slug}/threads", response_model=ThreadWithPosts, status_code=201)

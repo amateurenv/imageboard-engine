@@ -2,6 +2,12 @@
 
 import re
 
+from app.core.pagination import (
+    PostCursor,
+    ThreadCursor,
+    encode_post_cursor,
+    encode_thread_cursor,
+)
 from app.core.site_settings import SiteSettings
 from app.repositories.threads import PostRecord, ThreadRecord, ThreadsRepository
 from app.schemas.threads import (
@@ -9,6 +15,8 @@ from app.schemas.threads import (
     PostSummary,
     ThreadCreate,
     ThreadDetail,
+    ThreadListResponse,
+    ThreadPageResponse,
     ThreadSummary,
     ThreadWithPosts,
 )
@@ -32,36 +40,85 @@ class ThreadsService:
         self._site_settings = site_settings
         self._ws_manager = ws_manager
 
-    async def list_threads(self, board_slug: str) -> list[ThreadSummary] | None:
-        """список тредов доски, None если доски нет"""
+    async def list_threads(
+        self,
+        board_slug: str,
+        cursor: ThreadCursor | None,
+        limit: int,
+    ) -> ThreadListResponse | None:
+        """вернуть страницу тредов доски, None если доски нет"""
 
         board_id = await self._repository.get_board_id_by_slug(board_slug)
         if board_id is None:
             return None
 
-        return [
+        records = await self._repository.list_threads_page(
+            board_id=board_id,
+            cursor_sticky=None if cursor is None else cursor.sticky,
+            cursor_bumped_at=None if cursor is None else cursor.bumped_at,
+            cursor_id=None if cursor is None else cursor.id,
+            limit=limit,
+        )
+        page_records = records[:limit]
+        next_cursor = None
+
+        if len(records) > limit and page_records:
+            last_record = page_records[-1]
+            next_cursor = encode_thread_cursor(
+                board_slug=board_slug,
+                sticky=last_record.is_sticky,
+                bumped_at=last_record.bumped_at,
+                thread_id=last_record.id,
+            )
+
+        items = [
             ThreadSummary(
                 id=record.id,
                 subject=record.subject,
                 is_sticky=record.is_sticky,
                 bumped_at=record.bumped_at,
             )
-            for record in await self._repository.list_threads(board_id)
+            for record in page_records
         ]
 
-    async def get_thread(self, thread_id: int) -> ThreadWithPosts | None:
-        """тред и все его посты по порядку"""
+        return ThreadListResponse(items=items, next_cursor=next_cursor)
 
-        thread = await self._repository.get_thread(thread_id)
-        if thread is None:
+    async def get_thread(
+        self,
+        thread_id: int,
+        cursor: PostCursor | None,
+        limit: int,
+    ) -> ThreadPageResponse | None:
+        """вернуть OP и страницу последних или более старых ответов"""
+
+        page = await self._repository.get_thread_page(
+            thread_id=thread_id,
+            before_id=None if cursor is None else cursor.before_id,
+            limit=limit,
+        )
+        if page is None:
             return None
 
-        posts = [
+        reply_records = page.replies[:limit]
+        next_cursor = None
+        if len(page.replies) > limit and reply_records:
+            next_cursor = encode_post_cursor(
+                thread_id=thread_id,
+                before_id=reply_records[-1].id,
+            )
+
+        # база вернула ответы от новых к старым, интерфейс получает привычный порядок
+        replies = [
             self._to_post_summary(post)
-            for post in await self._repository.get_posts(thread_id)
+            for post in reversed(reply_records)
         ]
 
-        return ThreadWithPosts(thread=self._to_detail(thread), posts=posts)
+        return ThreadPageResponse(
+            thread=self._to_detail(page.thread),
+            op=None if page.op is None else self._to_post_summary(page.op),
+            replies=replies,
+            next_cursor=next_cursor,
+        )
 
     async def create_thread(
         self, board_slug: str, thread_create: ThreadCreate
