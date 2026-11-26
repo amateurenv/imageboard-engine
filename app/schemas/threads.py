@@ -50,7 +50,7 @@ class ThreadWithPosts(BaseModel):
 
 
 class ThreadCreate(BaseModel):
-    """создать тред (данные из запроса)"""
+    """создать тред вместе с первым постом"""
 
     # публичная форма не принимает staff-поля вроде is_sticky
     model_config = ConfigDict(extra="forbid")
@@ -58,10 +58,20 @@ class ThreadCreate(BaseModel):
     # заголовок треда, пустой допустим
     subject: str = Field(default="", max_length=1000)
 
+    # имя автора, пустое или None - анонимно
+    author_name: str | None = Field(default=None, max_length=500)
+
+    # тред без первого поста не создаём
+    body: str = Field(min_length=1, max_length=100000)
+
 
 class PostCreate(BaseModel):
     """создать пост в треде (данные из запроса)"""
 
+    # неизвестные поля в публичном запросе считаются ошибкой
+    model_config = ConfigDict(extra="forbid")
+
     # имя автора, пустое или None — анонимно
     author_name: str | None = Field(default=None, max_length=500)
-    body: str = Field(max_length=100000)
+    # без медиа пустой текст не имеет смысла
+    body: str = Field(min_length=1, max_length=100000)

@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.schemas.boards import BoardListResponse, BoardSummary
+from app.schemas.threads import PostCreate, ThreadCreate
 
 
 def test_board_summary_accepts_valid_slug() -> None:
@@ -50,3 +51,17 @@ def test_board_list_response_is_empty_by_default() -> None:
     response = BoardListResponse()
 
     assert response.items == []
+
+
+def test_thread_create_requires_opening_post() -> None:
+    """новый тред нельзя создать без текста первого поста"""
+
+    with pytest.raises(ValidationError):
+        ThreadCreate()
+
+
+def test_post_create_rejects_empty_body() -> None:
+    """текстовый пост не может быть пустым"""
+
+    with pytest.raises(ValidationError):
+        PostCreate(body="")

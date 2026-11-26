@@ -101,6 +101,14 @@ class PostCreationResult:
     was_bumped: bool
 
 
+@dataclass(frozen=True, slots=True)
+class ThreadCreationResult:
+    """результат создания треда с его первым постом"""
+
+    thread: ThreadRecord
+    post: PostRecord
+
+
 def _thread_record(row: Record) -> ThreadRecord:
     """превратить строку базы в запись треда"""
 
@@ -155,17 +163,46 @@ class ThreadsRepository:
         ]
 
     async def create_thread(
-        self, *, board_id: int, subject: str, is_sticky: bool
-    ) -> ThreadRecord:
-        """создать тред"""
+        self,
+        *,
+        board_id: int,
+        subject: str,
+        author_name: str | None,
+        body: str,
+    ) -> ThreadCreationResult:
+        """создать тред и первый пост в одной транзакции"""
 
-        row = await self._postgres_pool.fetchrow(
-            CREATE_THREAD_SQL, board_id, subject, is_sticky
+        async with self._postgres_pool.acquire() as connection:
+            async with connection.transaction():
+                thread_row = await connection.fetchrow(
+                    CREATE_THREAD_SQL,
+                    board_id,
+                    subject,
+                    False,
+                )
+                if thread_row is None:
+                    # insert без ошибки всегда возвращает строку
+                    raise RuntimeError(f"thread not created: board_id={board_id}")
+
+                post_row = await connection.fetchrow(
+                    CREATE_POST_SQL,
+                    thread_row["id"],
+                    author_name,
+                    body,
+                )
+                if post_row is None:
+                    # этот случай защищает от неполного ответа драйвера или базы
+                    raise RuntimeError(f"opening post not created: thread_id={thread_row['id']}")
+
+        return ThreadCreationResult(
+            thread=_thread_record(thread_row),
+            post=PostRecord(
+                id=post_row["id"],
+                author_name=author_name,
+                body=body,
+                created_at=post_row["created_at"],
+            ),
         )
-        if row is None:
-            # insert без ошибки всегда возвращает строку
-            raise RuntimeError(f"thread not created: board_id={board_id}")
-        return _thread_record(row)
 
     async def create_post(
         self,

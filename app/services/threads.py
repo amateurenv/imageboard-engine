@@ -65,23 +65,28 @@ class ThreadsService:
 
     async def create_thread(
         self, board_slug: str, thread_create: ThreadCreate
-    ) -> ThreadDetail | None:
-        """создать тред с проверкой длины заголовка по настройкам"""
+    ) -> ThreadWithPosts | None:
+        """создать тред с первым постом и проверкой настроек"""
 
         board_id = await self._repository.get_board_id_by_slug(board_slug)
         if board_id is None:
             return None
 
         self._check_subject_length(thread_create.subject)
+        self._check_post_length(thread_create.body)
+        self._check_author_name(thread_create.author_name)
 
-        thread = await self._repository.create_thread(
+        creation_result = await self._repository.create_thread(
             board_id=board_id,
             subject=thread_create.subject,
-            # закрепление доступно только через staff-маршруты
-            is_sticky=False,
+            author_name=thread_create.author_name or None,
+            body=thread_create.body,
         )
 
-        return self._to_detail(thread)
+        return ThreadWithPosts(
+            thread=self._to_detail(creation_result.thread),
+            posts=[self._to_post_summary(creation_result.post)],
+        )
 
     async def create_post(
         self, thread_id: int, post_create: PostCreate

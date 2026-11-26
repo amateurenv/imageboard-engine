@@ -14,7 +14,7 @@ from app.api.dependencies import (
 )
 from app.repositories.boards import BoardsRepository
 from app.schemas.boards import BoardListResponse, BoardSummary
-from app.schemas.threads import ThreadCreate, ThreadDetail, ThreadListResponse
+from app.schemas.threads import ThreadCreate, ThreadListResponse, ThreadWithPosts
 from app.services.boards import BoardsService
 
 # все маршруты этого модуля начинаются с /boards
@@ -76,7 +76,7 @@ async def list_threads(
     return ThreadListResponse(items=threads)
 
 
-@router.post("/{slug}/threads", response_model=ThreadDetail)
+@router.post("/{slug}/threads", response_model=ThreadWithPosts, status_code=201)
 async def create_thread(
     request: Request,
     slug: str,
@@ -84,8 +84,8 @@ async def create_thread(
     threads_service: ThreadsServiceDependency,
     ip_bans_repository: IpBansRepositoryDependency,
     spam_service: SpamServiceDependency,
-) -> ThreadDetail | None:
-    """создать тред в доске"""
+) -> ThreadWithPosts | None:
+    """создать тред с первым постом"""
 
     # забаненные IP не могут создавать треды
     await check_ip_bans(request, ip_bans_repository)

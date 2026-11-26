@@ -20,6 +20,15 @@ LOGIN_MAX_ATTEMPTS = 5
 # сколько секунд действует блокировка после неудачных попыток
 LOGIN_BLOCK_TTL_SECONDS = 600
 
+# redis выполняет скрипт целиком, поэтому параллельные ошибки не теряют счётчик
+RECORD_FAILED_LOGIN_SCRIPT = """
+local failures = redis.call('INCR', KEYS[1])
+if failures == 1 then
+    redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return failures
+"""
+
 
 class UsersService:
     """авторизация, сессии и доступ сотрудников"""
@@ -52,8 +61,13 @@ class UsersService:
         user = await self._repository.get_user_by_login(login)
 
         if user is None or not verify_password(password, user.password_hash):
-            await self._redis_client.incr(key)
-            await self._redis_client.expire(key, LOGIN_BLOCK_TTL_SECONDS)
+            # срок блокировки задаётся только при первой ошибке
+            await self._redis_client.eval(
+                RECORD_FAILED_LOGIN_SCRIPT,
+                1,
+                key,
+                LOGIN_BLOCK_TTL_SECONDS,
+            )
             raise HTTPException(status_code=401, detail="invalid login or password")
 
         # после успешного входа сбрасываем счётчик неудачных попыток
