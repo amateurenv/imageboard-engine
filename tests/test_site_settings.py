@@ -12,8 +12,10 @@ def test_default_site_settings() -> None:
     settings = get_default_site_settings()
 
     assert settings.thread.max_subject_length == 200
+    assert settings.thread.max_threads_per_board_day == 3
     assert settings.post.max_post_length == 10000
     assert settings.post.max_author_name_length == 50
+    assert settings.post.max_posts_per_thread_hour == 10
     assert settings.localization.default_locale == "ru"
     assert settings.localization.anonymous_name == "Аноним"
     assert settings.appearance.active_theme == "dark"

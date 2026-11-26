@@ -15,7 +15,9 @@ ORDER BY is_sticky DESC, bumped_at DESC, id DESC
 """
 
 GET_BOARD_ID_BY_SLUG_SQL = """
-SELECT id FROM boards WHERE slug = $1
+SELECT id
+FROM boards
+WHERE slug = $1 AND is_active = TRUE
 """
 
 GET_THREAD_SQL = """
@@ -50,6 +52,13 @@ VALUES ($1, $2, $3)
 RETURNING id, created_at
 """
 
+LOCK_THREAD_FOR_POST_SQL = """
+SELECT is_locked, is_archived
+FROM threads
+WHERE id = $1
+FOR UPDATE
+"""
+
 BUMP_THREAD_SQL = """
 UPDATE threads SET bumped_at = now() WHERE id = $1
 """
@@ -82,6 +91,14 @@ class PostRecord:
     author_name: str | None
     body: str
     created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class PostCreationResult:
+    """результат создания поста внутри треда"""
+
+    post: PostRecord
+    was_bumped: bool
 
 
 def _thread_record(row: Record) -> ThreadRecord:
@@ -157,20 +174,29 @@ class ThreadsRepository:
         author_name: str | None,
         body: str,
         reference_ids: list[int],
-    ) -> PostRecord:
-        """создать пост и поднять тред, всё в одной транзакции"""
+    ) -> PostCreationResult | None:
+        """создать пост и поднять доступный тред в одной транзакции"""
 
         async with self._postgres_pool.acquire() as connection:
             async with connection.transaction():
+                # блокируем строку треда, чтобы состояние не изменилось до коммита
+                thread_row = await connection.fetchrow(LOCK_THREAD_FOR_POST_SQL, thread_id)
+                if thread_row is None:
+                    return None
+
+                if thread_row["is_locked"]:
+                    raise ValueError("thread is locked")
+
+                if thread_row["is_archived"]:
+                    raise ValueError("thread is archived")
+
                 post_row = await connection.fetchrow(
                     CREATE_POST_SQL, thread_id, author_name, body
                 )
-                # архивный тред не поднимается новыми ответами
-                is_archived = await connection.fetchval(
-                    "SELECT is_archived FROM threads WHERE id = $1", thread_id
-                )
-                if not is_archived:
-                    await connection.execute(BUMP_THREAD_SQL, thread_id)
+
+                # архивные треды выше уже отклонены, поэтому успешный пост всегда bump
+                await connection.execute(BUMP_THREAD_SQL, thread_id)
+
                 if reference_ids:
                     # ссылки ведём только на посты, которые уже есть в базе
                     existing_rows = await connection.fetch(
@@ -186,11 +212,14 @@ class ThreadsRepository:
                                 target_id,
                             )
 
-        return PostRecord(
-            id=post_row["id"],
-            author_name=author_name,
-            body=body,
-            created_at=post_row["created_at"],
+        return PostCreationResult(
+            post=PostRecord(
+                id=post_row["id"],
+                author_name=author_name,
+                body=body,
+                created_at=post_row["created_at"],
+            ),
+            was_bumped=True,
         )
 
     async def update_thread(

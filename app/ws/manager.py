@@ -57,3 +57,13 @@ class WebSocketManager:
                 if isinstance(data, bytes):
                     data = data.decode("utf-8")
                 await self.send_to_all(data)
+
+
+class DisabledWebSocketManager(WebSocketManager):
+    """временная заглушка для выключенного realtime"""
+
+    def __init__(self) -> None:
+        """создать заглушку без redis и соединений"""
+
+    async def broadcast(self, event: dict[str, Any]) -> None:
+        """не отправлять события, пока realtime выключен"""

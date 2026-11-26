@@ -1,5 +1,6 @@
 """зависимости для HTTP-маршрутов"""
 
+from ipaddress import ip_address
 from typing import Annotated
 
 from asyncpg import Pool
@@ -7,13 +8,13 @@ from fastapi import Depends, HTTPException, Request
 from redis.asyncio import Redis
 from starlette.requests import HTTPConnection
 
+from app.core.config import get_settings
 from app.core.security import SESSION_COOKIE, hash_token
 from app.core.site_settings import SiteSettings
 from app.repositories.ip_bans import IpBansRepository
 from app.repositories.media import MediaRepository
 from app.repositories.threads import ThreadsRepository
 from app.repositories.users import UserRecord, UsersRepository
-from app.schemas.users import STAFF_ROLES
 from app.services.media import MediaService
 from app.services.spam import SpamService
 from app.services.staff import StaffService
@@ -34,6 +35,30 @@ def get_redis_client(request: Request) -> Redis:
 
     # клиент создаётся при запуске fastapi и хранится в состоянии приложения
     return request.app.state.redis_client
+
+
+def get_client_ip(request: Request) -> str:
+    """вернуть IP клиента, доверяя proxy только из списка настроек"""
+
+    peer_ip = request.client.host if request.client is not None else ""
+    trusted_proxy_ips = {
+        item.strip()
+        for item in get_settings().trusted_proxy_ips.split(",")
+        if item.strip()
+    }
+
+    if peer_ip not in trusted_proxy_ips:
+        return peer_ip
+
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    candidate_ip = forwarded_for.split(",", maxsplit=1)[0].strip()
+    if not candidate_ip:
+        return peer_ip
+
+    try:
+        return str(ip_address(candidate_ip))
+    except ValueError:
+        return peer_ip
 
 
 def get_site_settings(request: Request) -> SiteSettings:
@@ -152,18 +177,46 @@ type CurrentUserDependency = Annotated[
 ]
 
 
-async def get_current_staff_user(user: CurrentUserDependency) -> UserRecord:
-    """вернуть сотрудника, имеющего роль сотрудника"""
+async def get_moderator_user(user: CurrentUserDependency) -> UserRecord:
+    """вернуть сотрудника с правами модератора"""
 
-    if user.role not in STAFF_ROLES:
-        raise HTTPException(status_code=403, detail="staff access required")
+    if user.role not in {"owner", "admin", "moderator"}:
+        raise HTTPException(status_code=403, detail="moderator access required")
 
     return user
 
 
-type StaffUserDependency = Annotated[
+async def get_admin_user(user: CurrentUserDependency) -> UserRecord:
+    """вернуть сотрудника с правами администратора"""
+
+    if user.role not in {"owner", "admin"}:
+        raise HTTPException(status_code=403, detail="admin access required")
+
+    return user
+
+
+async def get_owner_user(user: CurrentUserDependency) -> UserRecord:
+    """вернуть владельца движка"""
+
+    if user.role != "owner":
+        raise HTTPException(status_code=403, detail="owner access required")
+
+    return user
+
+
+type ModeratorUserDependency = Annotated[
     UserRecord,
-    Depends(get_current_staff_user),
+    Depends(get_moderator_user),
+]
+
+type AdminUserDependency = Annotated[
+    UserRecord,
+    Depends(get_admin_user),
+]
+
+type OwnerUserDependency = Annotated[
+    UserRecord,
+    Depends(get_owner_user),
 ]
 
 
@@ -173,8 +226,8 @@ async def check_ip_bans(
 ) -> None:
     """забаненные IP не могут публиковать треды и посты"""
 
-    ip = request.client.host
-    if ip is not None and await ip_bans_repository.get_by_ip(ip) is not None:
+    ip = get_client_ip(request)
+    if ip and await ip_bans_repository.get_by_ip(ip) is not None:
         raise HTTPException(status_code=403, detail="ip is banned")
 
 
@@ -184,10 +237,13 @@ type IpBansRepositoryDependency = Annotated[
 ]
 
 
-def get_spam_service(redis_client: RedisClientDependency) -> SpamService:
+def get_spam_service(
+    redis_client: RedisClientDependency,
+    site_settings: SiteSettingsDependency,
+) -> SpamService:
     """создать сервис защиты от спама"""
 
-    return SpamService(redis_client)
+    return SpamService(redis_client, site_settings)
 
 
 type SpamServiceDependency = Annotated[

@@ -4,7 +4,7 @@ from fastapi import APIRouter
 
 from app.api.dependencies import (
     IpBansRepositoryDependency,
-    StaffUserDependency,
+    ModeratorUserDependency,
 )
 from app.repositories.ip_bans import IpBanRecord
 from app.schemas.staff import IpBanCreate, IpBanPublic
@@ -29,6 +29,7 @@ router = APIRouter(
 @router.get("", response_model=list[IpBanPublic])
 async def list_ip_bans(
     ip_bans_repository: IpBansRepositoryDependency,
+    moderator_user: ModeratorUserDependency,
 ) -> list[IpBanPublic]:
     """список всех банов по IP"""
 
@@ -40,12 +41,16 @@ async def list_ip_bans(
 @router.post("", response_model=IpBanPublic)
 async def create_ip_ban(
     ip_ban: IpBanCreate,
-    staff_user: StaffUserDependency,
+    moderator_user: ModeratorUserDependency,
     ip_bans_repository: IpBansRepositoryDependency,
 ) -> IpBanPublic:
     """забанить IP"""
 
-    record = await ip_bans_repository.create(ip_ban.ip, ip_ban.reason, staff_user.id)
+    record = await ip_bans_repository.create(
+        str(ip_ban.ip),
+        ip_ban.reason,
+        moderator_user.id,
+    )
 
     return _to_public(record)
 
@@ -54,6 +59,7 @@ async def create_ip_ban(
 async def delete_ip_ban(
     ip: str,
     ip_bans_repository: IpBansRepositoryDependency,
+    moderator_user: ModeratorUserDependency,
 ) -> None:
     """снять бан"""
 

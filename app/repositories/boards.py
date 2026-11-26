@@ -41,6 +41,21 @@ DELETE_BOARD_SQL = """
 DELETE FROM boards WHERE slug = $1
 """
 
+DELETE_BOARD_WITH_THREADS_SQL = """
+WITH target AS (
+    SELECT id
+    FROM boards
+    WHERE slug = $1
+    FOR UPDATE
+), deleted_threads AS (
+    DELETE FROM threads
+    WHERE board_id = (SELECT id FROM target)
+)
+DELETE FROM boards
+WHERE id = (SELECT id FROM target)
+RETURNING id
+"""
+
 UPDATE_BOARD_SQL = f"""
 UPDATE boards
 SET title = $2, description = $3, position = $4, is_active = $5, is_nsfw = $6
@@ -149,6 +164,15 @@ class BoardsRepository:
         """удалить доску"""
 
         await self._postgres_pool.execute(DELETE_BOARD_SQL, slug)
+
+    async def delete_board_with_threads(self, slug: str) -> int | None:
+        """удалить доску и все её треды одной транзакцией"""
+
+        async with self._postgres_pool.acquire() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(DELETE_BOARD_WITH_THREADS_SQL, slug)
+
+        return None if row is None else row["id"]
 
     async def update_board(
         self,

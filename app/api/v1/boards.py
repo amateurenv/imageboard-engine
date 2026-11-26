@@ -10,15 +10,10 @@ from app.api.dependencies import (
     SpamServiceDependency,
     ThreadsServiceDependency,
     check_ip_bans,
+    get_client_ip,
 )
 from app.repositories.boards import BoardsRepository
-from app.schemas.boards import (
-    BoardCreate,
-    BoardListResponse,
-    BoardManagement,
-    BoardSummary,
-    BoardUpdate,
-)
+from app.schemas.boards import BoardListResponse, BoardSummary
 from app.schemas.threads import ThreadCreate, ThreadDetail, ThreadListResponse
 from app.services.boards import BoardsService
 
@@ -67,31 +62,6 @@ async def get_board(
     return board
 
 
-@router.post("", response_model=BoardManagement)
-async def create_board(
-    board_create: BoardCreate,
-    boards_service: BoardsServiceDependency,
-) -> BoardManagement:
-    """создать доску"""
-
-    return await boards_service.create_board(board_create)
-
-
-@router.patch("/{slug}", response_model=BoardManagement)
-async def update_board(
-    slug: str,
-    board_update: BoardUpdate,
-    boards_service: BoardsServiceDependency,
-) -> BoardManagement | None:
-    """изменить доску"""
-
-    updated = await boards_service.update_board(slug, board_update)
-    if updated is None:
-        raise HTTPException(status_code=404, detail="board not found")
-
-    return updated
-
-
 @router.get("/{slug}/threads", response_model=ThreadListResponse)
 async def list_threads(
     slug: str,
@@ -121,7 +91,7 @@ async def create_thread(
     await check_ip_bans(request, ip_bans_repository)
 
     # rate limit создания тредов на доску
-    await spam_service.check_thread_limit(slug)
+    await spam_service.check_thread_limit(get_client_ip(request), slug)
 
     try:
         thread = await threads_service.create_thread(slug, thread_create)

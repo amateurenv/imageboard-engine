@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     # debug режим, строка true или false из .env станет bool
     app_debug: bool = False
 
+    # IP доверенных reverse proxy через запятую, пустая строка безопасна по умолчанию
+    trusted_proxy_ips: str = ""
+
     # адрес postgresql из DATABASE_URL в .env
     database_url: PostgresDsn
 

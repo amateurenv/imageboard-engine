@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter
 
-from app.api.dependencies import StaffServiceDependency, StaffUserDependency
+from app.api.dependencies import ModeratorUserDependency, StaffServiceDependency
 
 router = APIRouter(
     prefix="/admin/posts",
@@ -14,8 +14,8 @@ router = APIRouter(
 async def delete_post(
     post_id: int,
     staff_service: StaffServiceDependency,
-    staff_user: StaffUserDependency,
+    moderator_user: ModeratorUserDependency,
 ) -> None:
     """удалить пост"""
 
-    await staff_service.delete_post(staff_user.id, post_id)
+    await staff_service.delete_post(moderator_user.id, post_id)

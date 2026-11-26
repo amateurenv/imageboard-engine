@@ -7,6 +7,7 @@ from app.api.dependencies import (
     SpamServiceDependency,
     ThreadsServiceDependency,
     check_ip_bans,
+    get_client_ip,
 )
 from app.schemas.threads import PostCreate, PostSummary, ThreadWithPosts
 
@@ -45,7 +46,7 @@ async def create_post(
     await check_ip_bans(request, ip_bans_repository)
 
     # rate limit постинга в тред
-    await spam_service.check_post_limit(thread_id)
+    await spam_service.check_post_limit(get_client_ip(request), thread_id)
 
     try:
         post = await threads_service.create_post(thread_id, post_create)

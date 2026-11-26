@@ -77,7 +77,8 @@ class ThreadsService:
         thread = await self._repository.create_thread(
             board_id=board_id,
             subject=thread_create.subject,
-            is_sticky=thread_create.is_sticky,
+            # закрепление доступно только через staff-маршруты
+            is_sticky=False,
         )
 
         return self._to_detail(thread)
@@ -87,26 +88,22 @@ class ThreadsService:
     ) -> PostSummary | None:
         """создать пост в треде: вставка, бамп треда, ссылки >>N"""
 
-        thread = await self._repository.get_thread(thread_id)
-        if thread is None:
-            return None
-        if thread.is_locked:
-            raise ValueError("thread is locked")
-
         self._check_post_length(post_create.body)
         self._check_author_name(post_create.author_name)
 
         reference_ids = self._extract_references(post_create.body)
 
-        post = await self._repository.create_post(
+        creation_result = await self._repository.create_post(
             thread_id=thread_id,
             author_name=post_create.author_name or None,
             body=post_create.body,
             reference_ids=reference_ids,
         )
+        if creation_result is None:
+            return None
 
-        # транслируем realtime-события: новый пост и поднятие треда
-        post_summary = self._to_post_summary(post)
+        # транслируем realtime-событие только после успешного коммита поста
+        post_summary = self._to_post_summary(creation_result.post)
         await self._ws_manager.broadcast(
             {
                 "event": "post_created",
@@ -114,7 +111,8 @@ class ThreadsService:
                 "post": post_summary.model_dump(mode="json"),
             }
         )
-        await self._ws_manager.broadcast({"event": "thread_bumped", "thread_id": thread_id})
+        if creation_result.was_bumped:
+            await self._ws_manager.broadcast({"event": "thread_bumped", "thread_id": thread_id})
 
         return post_summary
 

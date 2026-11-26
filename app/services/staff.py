@@ -33,20 +33,15 @@ class StaffService:
         ]
 
     async def delete_board(self, actor_id: int, slug: str) -> bool:
-        """удалить доску: сначала треды её, потом саму доску, всё с журналом"""
+        """удалить доску и все её треды, записать действие в журнал"""
 
-        board = await self._boards_repository.get_by_slug(slug)
-        if board is None:
+        board_id = await self._boards_repository.delete_board_with_threads(slug)
+        if board_id is None:
             return False
 
-        # в базе удаление доски с тредами запрещено (ON DELETE RESTRICT),
-        # поэтому треды удаляем через стандартную логику
-        for thread in await self._threads_repository.list_threads(board.id):
-            await self.delete_thread(actor_id, thread.id, reason=f"board deleted: {slug}")
-
-        await self._boards_repository.delete_board(slug)
+        # удаление тредов и доски уже завершилось одной транзакцией repository
         await self._users_repository.log_moderation(
-            actor_id, "delete_board", "board", board.id, reason=f"board deleted: {slug}"
+            actor_id, "delete_board", "board", board_id, reason=f"board deleted: {slug}"
         )
         return True
 

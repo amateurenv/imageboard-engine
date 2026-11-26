@@ -13,6 +13,9 @@ class ThreadSettings(BaseModel):
     # 0 разрешает тред без заголовка
     max_subject_length: int = Field(default=200, ge=0, le=1000)
 
+    # 0 выключает лимит новых тредов на одной доске за сутки
+    max_threads_per_board_day: int = Field(default=3, ge=0, le=1000)
+
 
 # настройки создания постов
 class PostSettings(BaseModel):
@@ -25,6 +28,9 @@ class PostSettings(BaseModel):
 
     # 0 запрещает собственное имя автора
     max_author_name_length: int = Field(default=50, ge=0, le=500)
+
+    # 0 выключает лимит ответов в одном треде за час
+    max_posts_per_thread_hour: int = Field(default=10, ge=0, le=10000)
 
 
 # язык и имя анонима

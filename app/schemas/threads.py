@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ThreadSummary(BaseModel):
@@ -52,11 +52,11 @@ class ThreadWithPosts(BaseModel):
 class ThreadCreate(BaseModel):
     """создать тред (данные из запроса)"""
 
+    # публичная форма не принимает staff-поля вроде is_sticky
+    model_config = ConfigDict(extra="forbid")
+
     # заголовок треда, пустой допустим
     subject: str = Field(default="", max_length=1000)
-
-    # закреплённый тред всегда выше обычных в списке
-    is_sticky: bool = False
 
 
 class PostCreate(BaseModel):

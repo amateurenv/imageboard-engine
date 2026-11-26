@@ -3,49 +3,70 @@
 from fastapi import HTTPException
 from redis.asyncio import Redis
 
-# максимум новых тредов на доску за сутки
-MAX_THREADS_PER_BOARD_DAY = 3
-
-# максимум постов в треде за час
-MAX_POSTS_PER_THREAD_HOUR = 10
+from app.core.site_settings import SiteSettings
 
 # окна действия лимитов в секундах
 THREADS_WINDOW_SECONDS = 24 * 60 * 60
 POSTS_WINDOW_SECONDS = 60 * 60
 
+# lua выполняется в redis целиком, поэтому параллельные запросы не обходят лимит
+CHECK_AND_INCREMENT_SCRIPT = """
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+local limit = tonumber(ARGV[2])
+
+if current >= limit then
+    return 0
+end
+
+current = redis.call('INCR', KEYS[1])
+if current == 1 then
+    redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+
+return 1
+"""
+
 
 class SpamService:
     """rate limit создания тредов и постов через redis"""
 
-    def __init__(self, redis_client: Redis) -> None:
+    def __init__(self, redis_client: Redis, site_settings: SiteSettings) -> None:
         self._redis_client = redis_client
+        self._site_settings = site_settings
 
-    async def check_thread_limit(self, board_slug: str) -> None:
+    async def check_thread_limit(self, client_ip: str, board_slug: str) -> None:
         """проверить, не превышен ли лимит создания тредов на доску"""
 
         await self._check_limit(
-            f"spam:threads:{board_slug}",
-            MAX_THREADS_PER_BOARD_DAY,
+            f"spam:threads:{board_slug}:{client_ip}",
+            self._site_settings.thread.max_threads_per_board_day,
             THREADS_WINDOW_SECONDS,
-            f"thread creation limit exceeded on board {board_slug}",
+            "thread creation limit exceeded",
         )
 
-    async def check_post_limit(self, thread_id: int) -> None:
+    async def check_post_limit(self, client_ip: str, thread_id: int) -> None:
         """проверить, не превышен ли лимит постов в треде"""
 
         await self._check_limit(
-            f"spam:posts:{thread_id}",
-            MAX_POSTS_PER_THREAD_HOUR,
+            f"spam:posts:{thread_id}:{client_ip}",
+            self._site_settings.post.max_posts_per_thread_hour,
             POSTS_WINDOW_SECONDS,
-            f"post creation limit exceeded in thread {thread_id}",
+            "post creation limit exceeded",
         )
 
     async def _check_limit(self, key: str, limit: int, ttl: int, detail: str) -> None:
-        """проверить и увеличить счётчик, при превышении превышения — 429"""
+        """проверить и увеличить счётчик без гонки запросов"""
 
-        current = await self._redis_client.get(key)
-        if current is not None and int(current) >= limit:
+        # 0 в настройках значит, что владелец выключил конкретный лимит
+        if limit == 0:
+            return
+
+        allowed = await self._redis_client.eval(
+            CHECK_AND_INCREMENT_SCRIPT,
+            1,
+            key,
+            ttl,
+            limit,
+        )
+        if allowed != 1:
             raise HTTPException(status_code=429, detail=detail)
-
-        await self._redis_client.incr(key)
-        await self._redis_client.expire(key, ttl)

@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, IPvAnyAddress
 
 
 class ThreadUpdateAdmin(BaseModel):
@@ -17,7 +17,8 @@ class ThreadUpdateAdmin(BaseModel):
 class IpBanCreate(BaseModel):
     """создать бан по IP"""
 
-    ip: str = Field(min_length=1, max_length=64)
+    # pydantic не пропустит строку, которая не является ip адресом
+    ip: IPvAnyAddress
     reason: str | None = Field(default=None, max_length=500)
 
 
