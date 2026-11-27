@@ -21,6 +21,17 @@ server {
         limit_except GET HEAD { deny all; }
     }
 
+    # стикер лежит в display, отдельный location задаёт no-store для модерации
+    location ~ ^/_imageboard_media/stickers/([1-9][0-9]*)\.webp$ {
+        internal;
+        alias /srv/imageboard-media/display/$1.webp;
+        autoindex off;
+        default_type image/webp;
+        # nginx переносит content-disposition и cache-control из ответа с redirect
+        add_header X-Content-Type-Options "nosniff" always;
+        limit_except GET HEAD { deny all; }
+    }
+
     # audio derivative также доступен только после FastAPI проверки opaque key
     location ~ ^/_imageboard_media/audio/([1-9][0-9]*)\.m4a$ {
         internal;

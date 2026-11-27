@@ -2,8 +2,9 @@
 
 import asyncio
 import logging
+import secrets
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from asyncpg import Pool
@@ -25,12 +26,17 @@ from app.services.media_policy import (
     MediaType,
 )
 from app.services.media_storage import MediaStorage, MediaStorageError
-from app.services.posting_claims import PostingClaimError
+from app.services.posting_claims import (
+    PostingClaimError,
+    StickerCannotStartThread,
+    sticker_reply_policy,
+)
 from app.services.posting_policy import (
     PostingBoard,
     PostingPermissionError,
     check_posting_permission,
 )
+from app.services.sticker_processing import STICKER_MIME, decode_sticker
 from app.services.video_processing import VIDEO_MIME, VideoProcessor, looks_like_mp4_video
 
 # потоковая запись ограничивает память одного запроса даже для заявленного большого файла
@@ -143,11 +149,7 @@ class MediaUploadService:
                         channels=inspected.channels,
                         sample_rate=inspected.sample_rate,
                     )
-            try:
-                # postgres хранит queued источник истины, redis только сокращает ожидание worker
-                await self._redis.lpush("media:previews", media.id)
-            except Exception:
-                logger.warning("media %s is queued but redis wake-up failed", media.id)
+            await self._wake_worker(media.id)
             return media
         except Exception:
             if path is not None:
@@ -178,6 +180,72 @@ class MediaUploadService:
             audio = self._audio_processor.inspect(path)
             return self._audio_inspection(audio)
         return UploadInspection(image.mime_type, image.media_type, image.is_animation)
+
+    async def stage_sticker(
+        self, *, thread_id: int | None, actor: UserRecord, data: bytes,
+    ) -> tuple[str, MediaRecord]:
+        """поставить один стикер в очередь от доверенного адаптера с аккаунтом"""
+
+        if thread_id is None:
+            raise StickerCannotStartThread()
+        image = await asyncio.to_thread(decode_sticker, data)
+        image.close()
+        token = secrets.token_urlsafe(32)
+        staging = asyncio.create_task(self._store_sticker(thread_id, actor, token, data))
+        try:
+            media = await asyncio.shield(staging)
+        except asyncio.CancelledError:
+            # дождаться commit или отката - закрытый claim истечёт, если адаптер ушёл
+            await asyncio.gather(staging, return_exceptions=True)
+            raise
+        await self._wake_worker(media.id)
+        return token, media
+
+    async def _store_sticker(
+        self, thread_id: int, actor: UserRecord, token: str, data: bytes,
+    ) -> MediaRecord:
+        """сохранить закрытый claim и задачу обработки с общим commit"""
+
+        path: str | None = None
+        try:
+            async with self._pool.acquire() as connection:
+                async with connection.transaction():
+                    board = await self._claims.lock_sticker_target(connection, thread_id)
+                    if board is None:
+                        raise PostingClaimError("sticker_thread_unavailable", 404)
+                    sticker_reply_policy(board, actor, self._settings).validate(
+                        [MediaAttachment(MediaType.STICKER, len(data))]
+                    )
+                    claim_id = await self._claims.create_sticker_claim(
+                        connection, board.id, thread_id, actor.id, hash_token(token),
+                        timedelta(minutes=self._settings.posting_claims.ttl_minutes),
+                    )
+                    relative_path = self._storage.new_quarantine_path(".upload")
+                    descriptor, _ = self._storage.open_new(relative_path)
+                    path = relative_path
+                    with open(descriptor, "wb", closefd=True) as target:
+                        target.write(data)
+                    media = await self._media.create_in_transaction(
+                        connection, path=path, size=len(data), mime_type=STICKER_MIME,
+                        board_id=board.id, posting_claim_id=claim_id,
+                        is_animation=False, media_kind=MediaType.STICKER.value,
+                    )
+        except Exception:
+            if path is not None:
+                try:
+                    self._storage.delete_file(path)
+                except (MediaStorageError, OSError):
+                    logger.exception("could not remove failed quarantine sticker")
+            raise
+        return media
+
+    async def _wake_worker(self, media_id: int) -> None:
+        """сократить ожидание worker, сохраняя очередь в postgres"""
+
+        try:
+            await self._redis.lpush("media:previews", media_id)
+        except Exception:
+            logger.warning("media %s is queued but redis wake-up failed", media_id)
 
     @staticmethod
     def _audio_inspection(audio: AudioInspection) -> UploadInspection:
@@ -245,6 +313,8 @@ class MediaUploadService:
             raise PostingClaimError("posting_claim_invalid", 403)
         actor_id = None if actor is None else actor.id
         if claim.board_id != board.id or claim.account_user_id != actor_id:
+            raise PostingClaimError("posting_claim_forbidden", 403)
+        if claim.sticker_thread_id is not None:
             raise PostingClaimError("posting_claim_forbidden", 403)
         return claim
 

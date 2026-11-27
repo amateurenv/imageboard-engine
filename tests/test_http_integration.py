@@ -29,6 +29,13 @@ from app.repositories.posting_claims import PostingClaimsRepository
 from app.repositories.users import UsersRepository
 from app.services.media_policy import MEBIBYTE, MediaPolicyError, MediaType
 from app.services.media_storage import MediaStorage
+from app.services.media_upload import MediaUploadService
+from app.services.posting_claims import (
+    PostingClaimError,
+    PostingClaimsService,
+    StickerCannotStartThread,
+)
+from app.services.sticker_processing import MAX_STICKER_BYTES, STICKER_REPLY_WARNING
 from app.services.video_processing import VideoProcessor
 from app.ws.manager import DisabledWebSocketManager
 from scripts.cleanup_media_files import cleanup_media_files
@@ -36,6 +43,211 @@ from scripts.media_worker import MAX_PROCESSING_ATTEMPTS, PROCESSING_LEASE, proc
 
 pytestmark = pytest.mark.integration
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.anyio
+async def test_internal_sticker_publication_visibility_and_cleanup(
+    http_client: AsyncClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """проверить изоляцию claim, готовую выдачу и очистку статического стикера"""
+
+    pool = app.state.postgres_pool
+    settings = app.state.site_settings
+    users = UsersRepository(pool)
+    author = await users.create_profile_user("alice", hash_password("profile-password"))
+    other = await users.create_profile_user("bob", hash_password("other-password"))
+    csrf = await login(http_client, "alice", "profile-password")
+    thread = await http_client.post("/api/v1/boards/alice/threads", json={"body": "opening"})
+    assert thread.status_code == 201, thread.text
+    thread_id = thread.json()["thread"]["id"]
+    other_thread = await http_client.post("/api/v1/boards/alice/threads", json={"body": "other"})
+    assert other_thread.status_code == 201
+    other_thread_id = other_thread.json()["thread"]["id"]
+    reply_url = f"/api/v1/threads/{thread_id}/posts"
+    media_url = "/api/v1/boards/alice/media"
+    moderation_url = f"/api/v1/profiles/alice/threads/{thread_id}"
+
+    image = BytesIO()
+    Image.new("RGBA", (512, 128), (20, 90, 150, 67)).save(image, "WEBP")
+    payload = image.getvalue()
+    storage = MediaStorage(app.state.media_storage_root)
+    upload = MediaUploadService(pool, app.state.redis_client, settings, storage.root)
+    posting = PostingClaimsService(pool, settings)
+    repository = MediaRepository(pool)
+
+    with pytest.raises(StickerCannotStartThread) as rejected:
+        await upload.stage_sticker(thread_id=None, actor=author, data=payload)
+    assert rejected.value.code == "sticker_cannot_start_thread"
+    assert str(rejected.value) == STICKER_REPLY_WARNING
+    with pytest.raises(StickerCannotStartThread):
+        await posting.publish_sticker(thread_id=None, actor=author, token="", media_id=0)
+    with pytest.raises(MediaPolicyError) as invalid:
+        await upload.stage_sticker(thread_id=thread_id, actor=author, data=image_bytes("WEBP"))
+    assert invalid.value.code.value == "invalid_media"
+
+    token, queued = await upload.stage_sticker(thread_id=thread_id, actor=author, data=payload)
+    assert queued.media_kind == "sticker" and queued.processing_state.value == "queued"
+    with pytest.raises(PostingClaimError, match="posting_claim_media_invalid"):
+        await posting.publish_sticker(
+            thread_id=thread_id, actor=author, token=token, media_id=queued.id,
+        )
+
+    claimed = await repository.claim_by_id(
+        queued.id, max_attempts=MAX_PROCESSING_ATTEMPTS, lease_duration=PROCESSING_LEASE,
+    )
+    assert claimed is not None
+    await process_job(repository, queued.id, storage, expected_lease=claimed.processing_lease_until)
+    ready = await repository.get_by_id(queued.id)
+    assert ready is not None and ready.processing_state.value == "ready"
+    assert ready.display_path == f"display/{queued.id}.webp" and ready.preview_path is None
+    canonical = storage.resolve(ready.display_path)
+    with Image.open(canonical) as rendered:
+        assert rendered.format == "WEBP" and rendered.size == (512, 128) and rendered.n_frames == 1
+        assert rendered.getpixel((1, 1))[3] == 67
+        assert canonical.stat().st_size <= MAX_STICKER_BYTES
+    assert await cleanup_media_files(repository=repository, storage=storage) == 1
+    assert not storage.resolve(queued.path).exists()
+
+    params = {"body": "caption", "posting_claim_token": token, "media_ids": [queued.id]}
+    op = await http_client.post("/api/v1/boards/alice/threads", json=params)
+    assert op.status_code == 422 and op.json()["detail"]["code"] == "sticker_cannot_start_thread"
+    blocked = await http_client.post(reply_url, json=params)
+    assert blocked.status_code == 403
+    assert blocked.json()["detail"]["code"] == "posting_claim_media_invalid"
+    public_upload = await http_client.post(
+        media_url, data={"posting_claim_token": token, "media_kind": "sticker"},
+        files={"file": ("sticker.webp", payload, "image/webp")},
+    )
+    assert public_upload.status_code == 403
+
+    claim = await http_client.post("/api/v1/boards/alice/posting-claims")
+    normal_token = claim.json()["token"]
+    ordinary = await http_client.post(
+        media_url, data={"posting_claim_token": normal_token, "media_kind": "sticker"},
+        files={"file": ("sticker.webp", payload, "image/webp")},
+    )
+    assert ordinary.status_code == 201 and ordinary.json()["media_kind"] == "image"
+    with pytest.raises(PostingClaimError, match="posting_claim_forbidden"):
+        await posting.publish_sticker(
+            thread_id=thread_id, actor=other, token=token, media_id=queued.id,
+        )
+    with pytest.raises(PostingClaimError, match="posting_claim_media_invalid"):
+        await posting.publish_sticker(
+            thread_id=other_thread_id, actor=author, token=token, media_id=queued.id,
+        )
+    locked = await http_client.patch(moderation_url, headers=csrf, json={"is_locked": True})
+    assert locked.status_code == 200
+    with pytest.raises(PostingClaimError, match="sticker_thread_unavailable"):
+        await posting.publish_sticker(
+            thread_id=thread_id, actor=author, token=token, media_id=queued.id,
+        )
+    unlocked = await http_client.patch(moderation_url, headers=csrf, json={"is_locked": False})
+    assert unlocked.status_code == 200
+
+    async def publish():
+        return await posting.publish_sticker(
+            thread_id=thread_id, actor=author, token=token, media_id=queued.id,
+        )
+
+    attach_and_consume = PostingClaimsRepository.attach_and_consume
+
+    async def fail_after_attach(self, connection, claim_id, post_id, media_ids, public_keys):
+        await attach_and_consume(self, connection, claim_id, post_id, media_ids, public_keys)
+        raise RuntimeError("simulated publication failure")
+
+    # откат после attach должен вернуть claim, media и тред в прежнее состояние
+    read_url = f"/api/v1/threads/{thread_id}"
+    before = (await http_client.get(read_url)).json()
+    with monkeypatch.context() as patch:
+        patch.setattr(PostingClaimsRepository, "attach_and_consume", fail_after_attach)
+        with pytest.raises(RuntimeError, match="simulated publication failure"):
+            await publish()
+    assert (await http_client.get(read_url)).json() == before
+    rolled_back = await pool.fetchrow(
+        """SELECT media.post_id, media.public_key, claim.consumed_at
+           FROM media JOIN posting_claims AS claim ON claim.id=media.posting_claim_id
+           WHERE media.id=$1""",
+        queued.id,
+    )
+    assert rolled_back is not None and tuple(rolled_back) == (None, None, None)
+
+    first, second = await asyncio.gather(publish(), publish(), return_exceptions=True)
+    failures = [result for result in (first, second) if isinstance(result, PostingClaimError)]
+    assert len(failures) == 1 and failures[0].code == "posting_claim_invalid"
+    page = await http_client.get(read_url)
+    replies = page.json()["replies"]
+    assert len(replies) == 1 and replies[0]["body"] == ""
+    (item,) = replies[0]["media"]
+    assert item["media_kind"] == "sticker" and not item["is_animation"]
+    assert item["preview_url"] is None and item["content_url"] is None
+    url = item["display_url"]
+    internal_url = f"/_imageboard_media/stickers/{queued.id}.webp"
+    for method in (http_client.get, http_client.head):
+        delivered = await method(url)
+        assert delivered.status_code == 200 and delivered.content == b""
+        assert delivered.headers["content-type"] == "image/webp"
+        assert delivered.headers["x-accel-redirect"] == internal_url
+        assert delivered.headers["cache-control"] == "no-store"
+    for kind in ("preview", "content"):
+        assert (await http_client.get(url.removesuffix("display") + kind)).status_code == 404
+    hidden = await http_client.patch(moderation_url, headers=csrf, json={"is_hidden": True})
+    assert hidden.status_code == 200
+    assert (await http_client.get(url)).status_code == 404
+    assert (await http_client.delete(moderation_url, headers=csrf)).status_code == 204
+    assert await cleanup_media_files(repository=repository, storage=storage) == 1
+    assert not canonical.exists()
+
+
+@pytest.mark.anyio
+async def test_sticker_worker_replace_failure_keeps_quarantine_until_claim_expires(
+    http_client: AsyncClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """проверить откат готовности при файловой ошибке и очистку истёкшего claim"""
+
+    pool = app.state.postgres_pool
+    actor = await UsersRepository(pool).create_profile_user(
+        "alice", hash_password("profile-password"),
+    )
+    await login(http_client, "alice", "profile-password")
+    thread = await http_client.post("/api/v1/boards/alice/threads", json={"body": "opening"})
+    assert thread.status_code == 201
+    storage = MediaStorage(app.state.media_storage_root)
+    upload = MediaUploadService(pool, app.state.redis_client, app.state.site_settings, storage.root)
+    image = BytesIO()
+    Image.new("RGBA", (240, 512), (0, 0, 0, 0)).save(image, "WEBP", lossless=True)
+    _, queued = await upload.stage_sticker(
+        thread_id=thread.json()["thread"]["id"], actor=actor, data=image.getvalue(),
+    )
+    repository = MediaRepository(pool)
+    claimed = await repository.claim_by_id(
+        queued.id, max_attempts=MAX_PROCESSING_ATTEMPTS, lease_duration=PROCESSING_LEASE,
+    )
+    assert claimed is not None
+
+    def reject_replace(_temporary: Path, _relative_path: str) -> Path:
+        raise OSError("simulated storage failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(storage, "replace_from_temporary", reject_replace)
+        with pytest.raises(OSError, match="simulated storage failure"):
+            await process_job(repository, queued.id, storage)
+
+    media = await repository.get_by_id(queued.id)
+    assert media is not None and media.processing_state.value == "processing"
+    assert media.display_path is None and storage.resolve(media.path).is_file()
+    assert not list((storage.root / "display").iterdir())
+    assert await cleanup_media_files(repository=repository, storage=storage) == 0
+    await process_job(repository, queued.id, storage, expected_lease=claimed.processing_lease_until)
+    assert storage.resolve(f"display/{queued.id}.webp").is_file()
+
+    await pool.execute(
+        "UPDATE posting_claims SET expires_at = clock_timestamp() WHERE id = $1",
+        queued.posting_claim_id,
+    )
+    assert await PostingClaimsRepository(pool).cleanup_expired() == 1
+    assert await repository.get_by_id(queued.id) is None
+    assert await cleanup_media_files(repository=repository, storage=storage) == 2
+    assert not [file for file in storage.root.rglob("*") if file.is_file()]
 
 
 @pytest.fixture

@@ -366,7 +366,8 @@ class ThreadsService:
                         else None
                     ),
                     display_url=(
-                        f"/media/{item.public_key}/display" if item.media_kind == "image" else None
+                        f"/media/{item.public_key}/display"
+                        if item.media_kind in {"image", "sticker"} else None
                     ),
                     content_url=(
                         f"/media/{item.public_key}/content"

@@ -17,6 +17,7 @@ from app.services.media_policy import MediaType
 from app.services.media_queue import MediaProcessingState
 from app.services.media_scanner import MediaScanner, NoopMediaScanner
 from app.services.media_storage import MediaStorage
+from app.services.sticker_processing import transcode_sticker
 from app.services.video_processing import VIDEO_KINDS, VideoProcessor
 
 # redis будит worker раньше следующей проверки, но postgresql остаётся источником истины
@@ -183,6 +184,30 @@ async def process_job(
     source_path = storage.resolve(media.path)
     # production scanner подключат здесь - до derivative и перевода media в ready
     await asyncio.to_thread((scanner or NoopMediaScanner()).scan, source_path)
+    if media.media_kind == MediaType.STICKER:
+        lease = media.processing_lease_until
+        if lease is None:
+            raise RuntimeError("media processing lease was lost")
+        display_path = f"display/{media.id}.webp"
+        temporary = storage.temporary_path(display_path)
+        conversion = asyncio.create_task(
+            asyncio.to_thread(transcode_sticker, source_path, temporary)
+        )
+        try:
+            await asyncio.shield(conversion)
+            async with repository.transaction() as connection:
+                ready_sticker = await repository.mark_sticker_ready(
+                    connection, media.id, lease=lease, display_path=display_path,
+                )
+                if not ready_sticker:
+                    raise RuntimeError("media processing lease was lost")
+                # выдача станет возможна после замены файла и коммита ready
+                storage.replace_from_temporary(temporary, display_path)
+        finally:
+            if not conversion.done():
+                await asyncio.gather(conversion, return_exceptions=True)
+            temporary.unlink(missing_ok=True)
+        return
     if media.media_kind in VIDEO_KINDS:
         settings = get_settings()
         await _process_video(

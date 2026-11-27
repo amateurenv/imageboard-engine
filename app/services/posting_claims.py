@@ -25,15 +25,35 @@ from app.services.posting_policy import (
     PostingPermissionError,
     check_posting_permission,
 )
+from app.services.sticker_processing import STICKER_REPLY_WARNING
 
 
 class PostingClaimError(ValueError):
     """стабильная ошибка claim без раскрытия token или чужого media"""
 
-    def __init__(self, code: str, status_code: int = 422) -> None:
+    def __init__(self, code: str, status_code: int = 422, *, message: str | None = None) -> None:
         self.code = code
         self.status_code = status_code
-        super().__init__(code)
+        super().__init__(message or code)
+
+
+class StickerCannotStartThread(PostingClaimError):
+    """предупреждение для адаптера при попытке начать тред стикером"""
+
+    def __init__(self) -> None:
+        super().__init__("sticker_cannot_start_thread", message=STICKER_REPLY_WARNING)
+
+
+def sticker_reply_policy(board: ClaimBoard, actor: UserRecord, settings: SiteSettings) -> MediaPolicy:
+    """применить текущие правила ответа и загрузки к закрытому claim"""
+
+    check_posting_permission(
+        PostingBoard(board.board_type, board.owner_user_id, board.thread_creation_policy, board.reply_policy),
+        policy=board.reply_policy, actor_user_id=actor.id, actor_role=actor.role,
+    )
+    return MediaPolicy.from_settings(
+        settings.media, BoardMediaOverrides.model_validate(board.media_overrides)
+    )
 
 
 class PostingClaimsService:
@@ -85,7 +105,9 @@ class PostingClaimsService:
 
         async with self._pool.acquire() as connection:
             async with connection.transaction():
-                claim = await self._validate_claim(connection, board, actor, token, media_ids)
+                claim = await self._validate_claim(
+                    connection, board, actor, token, media_ids, starting_thread=True,
+                )
                 result = await self._threads.create_thread_in_transaction(
                     connection, board_id=board.id, subject=subject, author_name=author_name,
                     body=body, author_user_id=None if actor is None else actor.id,
@@ -124,8 +146,35 @@ class PostingClaimsService:
                 )
         return result
 
+    async def publish_sticker(
+        self, *, thread_id: int | None, actor: UserRecord, token: str, media_id: int,
+    ) -> PostCreationResult:
+        """опубликовать один готовый стикер отдельным ответом от связанного аккаунта"""
+
+        if thread_id is None:
+            raise StickerCannotStartThread()
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                board = await self._claims.lock_sticker_target(connection, thread_id)
+                if board is None:
+                    raise PostingClaimError("sticker_thread_unavailable", 404)
+                claim = await self._validate_claim(
+                    connection, board, actor, token, [media_id], sticker_thread_id=thread_id,
+                )
+                result = await self._threads.create_post_in_transaction(
+                    connection, thread_id=thread_id, author_name=None,
+                    body="", reference_ids=[], author_user_id=actor.id, deletion_password_hash=None,
+                )
+                await self._claims.attach_and_consume(
+                    connection, claim.id, result.post.id, [media_id], self._new_public_keys([media_id]),
+                )
+        return result
+
     async def _validate_claim(self, connection: Connection, board: ClaimBoard, actor: UserRecord | None,
-                              token: str, media_ids: list[int]) -> PostingClaim:
+                              token: str, media_ids: list[int], *, starting_thread: bool = False,
+                              sticker_thread_id: int | None = None) -> PostingClaim:
+        """заблокировать claim и готовые вложения до записи поста и расходования claim"""
+
         if not token or not media_ids or len(set(media_ids)) != len(media_ids):
             raise PostingClaimError("posting_claim_required")
         claim = await self._claims.lock_claim(connection, hash_token(token))
@@ -133,11 +182,26 @@ class PostingClaimsService:
             raise PostingClaimError("posting_claim_invalid", 403)
         if claim.board_id != board.id or claim.account_user_id != (None if actor is None else actor.id):
             raise PostingClaimError("posting_claim_forbidden", 403)
+        if starting_thread and claim.sticker_thread_id is not None:
+            raise StickerCannotStartThread()
+        if claim.sticker_thread_id != sticker_thread_id:
+            raise PostingClaimError("posting_claim_media_invalid", 403)
         if len(media_ids) > claim.max_attachments:
             raise PostingClaimError("media_count_exceeded")
         media = await self._claims.lock_media(connection, claim.id, board.id, media_ids)
-        # даже готовый кружок требует доверенного источника публикации
-        if len(media) != len(media_ids) or any(item.media_kind == "video_note" for item in media):
+        if starting_thread and any(item.media_kind == "sticker" for item in media):
+            raise StickerCannotStartThread()
+        if len(media) != len(media_ids):
+            raise PostingClaimError("posting_claim_media_invalid", 403)
+        if sticker_thread_id is not None:
+            if actor is None or len(media) != 1 or media[0].media_kind != "sticker":
+                raise PostingClaimError("posting_claim_media_invalid", 403)
+            sticker_reply_policy(board, actor, self._settings).validate(
+                [MediaAttachment(MediaType.STICKER, media[0].size)]
+            )
+            return claim
+        # готовые стикеры и видеокружки требуют доверенного источника публикации
+        if any(item.media_kind in {"video_note", "sticker"} for item in media):
             raise PostingClaimError("posting_claim_media_invalid", 403)
         self._policy(board).validate(
             [

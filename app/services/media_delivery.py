@@ -95,6 +95,14 @@ class MediaDeliveryService:
                 content_type=media.canonical_mime_type or "application/octet-stream",
                 accel_path=f"{INTERNAL_ACCEL_PREFIX}/{media.canonical_path}",
             )
+        if media.media_kind == "sticker":
+            if asset_kind != "display" or media.display_path != f"display/{media.id}.webp":
+                return None
+            # отдельный internal location оставляет проверку видимости за api после модерации
+            return MediaDelivery(
+                "image/webp", f"{INTERNAL_ACCEL_PREFIX}/stickers/{media.id}.webp",
+                cache_control="no-store",
+            )
         if media.media_kind != "image":
             return None
         relative_path = media.preview_path if asset_kind == "preview" else media.display_path

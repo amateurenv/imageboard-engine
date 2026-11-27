@@ -152,6 +152,7 @@ WHERE media.post_id = ANY($1::bigint[])
       (media.media_kind='image' AND media.display_path IS NOT NULL
        AND media.preview_path IS NOT NULL)
       OR (media.media_kind IN ('audio', 'voice') AND media.canonical_path IS NOT NULL)
+      OR (media.media_kind='sticker' AND media.display_path IS NOT NULL)
       OR (media.media_kind IN ('video', 'video_note') AND media.canonical_path IS NOT NULL
           AND media.preview_path IS NOT NULL AND media.canonical_mime_type = 'video/mp4')
   )

@@ -123,6 +123,23 @@ ON CONFLICT (relative_path) DO UPDATE SET completed_at = NULL
 RETURNING relative_path
 """
 
+MARK_STICKER_READY_SQL = """
+WITH ready AS (
+    UPDATE media
+    SET processing_state = 'ready',
+        processing_lease_until = NULL,
+        last_processing_error = NULL,
+        display_path = $3
+    WHERE id = $1 AND processing_state = 'processing' AND media_kind = 'sticker'
+      AND processing_lease_until = $2 AND processing_lease_until > clock_timestamp()
+    RETURNING path
+)
+INSERT INTO media_cleanup_tasks (relative_path)
+SELECT path FROM ready
+ON CONFLICT (relative_path) DO UPDATE SET completed_at = NULL
+RETURNING relative_path
+"""
+
 FAIL_PROCESSING_SQL = """
 UPDATE media
 SET processing_state = CASE
@@ -427,6 +444,15 @@ class MediaRepository:
         return await connection.fetchval(
             MARK_VIDEO_READY_SQL, media_id, lease, canonical_path, preview_path,
             duration_seconds, channels, sample_rate,
+        ) is not None
+
+    async def mark_sticker_ready(
+        self, connection: Connection, media_id: int, *, lease: datetime, display_path: str,
+    ) -> bool:
+        """запланировать очистку quarantine в той же транзакции, что и готовность стикера"""
+
+        return await connection.fetchval(
+            MARK_STICKER_READY_SQL, media_id, lease, display_path,
         ) is not None
 
     async def fail_processing(

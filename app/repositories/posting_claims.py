@@ -27,6 +27,7 @@ class PostingClaim:
     expires_at: datetime
     consumed_at: datetime | None
     max_attachments: int
+    sticker_thread_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +43,7 @@ def _claim(row: Record) -> PostingClaim:
     return PostingClaim(
         row["id"], row["board_id"], row["account_user_id"], row["expires_at"],
         row["consumed_at"], row["max_attachments"],
+        row["sticker_thread_id"],
     )
 
 
@@ -86,6 +88,48 @@ class PostingClaimsRepository:
             raw if isinstance(raw, dict) else json.loads(raw),
         )
 
+    async def lock_sticker_target(self, connection: Connection, thread_id: int) -> ClaimBoard | None:
+        """зафиксировать правила доски и видимость треда до окончания транзакции"""
+
+        # удаление доски блокирует доску перед тредами - здесь сохраняем тот же порядок
+        row = await connection.fetchrow(
+            """SELECT id, board_type, owner_user_id, thread_creation_policy, reply_policy,
+                      media_overrides
+               FROM boards WHERE is_active AND id=(SELECT board_id FROM threads WHERE id=$1)
+               FOR SHARE""",
+            thread_id,
+        )
+        if row is None:
+            return None
+        target = await connection.fetchval(
+            """SELECT id FROM threads
+               WHERE id=$1 AND board_id=$2 AND NOT is_hidden AND NOT is_locked AND NOT is_archived
+               FOR UPDATE""",
+            thread_id, row["id"],
+        )
+        if target is None:
+            return None
+        raw = row["media_overrides"]
+        return ClaimBoard(
+            row["id"], row["board_type"], row["owner_user_id"],
+            row["thread_creation_policy"], row["reply_policy"],
+            raw if isinstance(raw, dict) else json.loads(raw),
+        )
+
+    async def create_sticker_claim(
+        self, connection: Connection, board_id: int, thread_id: int, actor_id: int,
+        token_hash: str, ttl: timedelta,
+    ) -> int:
+        """создать одноразовый claim на один стикер для конкретного ответа"""
+
+        claim_id: int = await connection.fetchval(
+            """INSERT INTO posting_claims
+               (board_id, account_user_id, token_hash, expires_at, max_attachments, sticker_thread_id)
+               VALUES ($1,$2,$3,clock_timestamp()+$4::interval,1,$5) RETURNING id""",
+            board_id, actor_id, token_hash, ttl, thread_id,
+        )
+        return claim_id
+
     async def create(
         self, board_id: int, account_user_id: int | None, token_hash: str,
         ttl: timedelta, max_attachments: int,
@@ -94,7 +138,8 @@ class PostingClaimsRepository:
             """INSERT INTO posting_claims
                (board_id, account_user_id, token_hash, expires_at, max_attachments)
                VALUES ($1,$2,$3,clock_timestamp()+$4::interval,$5)
-               RETURNING id,board_id,account_user_id,expires_at,consumed_at,max_attachments""",
+               RETURNING id,board_id,account_user_id,expires_at,consumed_at,max_attachments,
+                         sticker_thread_id""",
             board_id, account_user_id, token_hash, ttl, max_attachments,
         )
         if row is None:
@@ -105,14 +150,14 @@ class PostingClaimsRepository:
         """прочитать claim перед проверкой содержимого файла"""
 
         row = await self._pool.fetchrow(
-            """SELECT id,board_id,account_user_id,expires_at,consumed_at,max_attachments
+            """SELECT id,board_id,account_user_id,expires_at,consumed_at,max_attachments,sticker_thread_id
                FROM posting_claims WHERE token_hash=$1""", token_hash,
         )
         return None if row is None else _claim(row)
 
     async def lock_claim(self, connection: Connection, token_hash: str) -> PostingClaim | None:
         row = await connection.fetchrow(
-            """SELECT id,board_id,account_user_id,expires_at,consumed_at,max_attachments
+            """SELECT id,board_id,account_user_id,expires_at,consumed_at,max_attachments,sticker_thread_id
                FROM posting_claims WHERE token_hash=$1 FOR UPDATE""", token_hash
         )
         return None if row is None else _claim(row)
@@ -184,6 +229,9 @@ class PostingClaimsRepository:
                            WHEN media.media_kind='image'
                             AND media.display_path IS NOT NULL
                             AND media.preview_path IS NOT NULL
+                           THEN $5
+                           WHEN media.media_kind='sticker'
+                            AND media.display_path IS NOT NULL
                            THEN $5
                            WHEN media.media_kind IN ('audio', 'voice')
                             AND media.canonical_path IS NOT NULL
