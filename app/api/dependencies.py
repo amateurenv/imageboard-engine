@@ -1,5 +1,6 @@
 """зависимости для HTTP-маршрутов"""
 
+from hmac import compare_digest
 from ipaddress import ip_address
 from typing import Annotated
 
@@ -9,13 +10,18 @@ from redis.asyncio import Redis
 from starlette.requests import HTTPConnection
 
 from app.core.config import get_settings
-from app.core.security import SESSION_COOKIE, hash_token
+from app.core.security import CSRF_COOKIE, CSRF_HEADER, SESSION_COOKIE, hash_token
 from app.core.site_settings import SiteSettings
 from app.repositories.ip_bans import IpBansRepository
 from app.repositories.media import MediaRepository
+from app.repositories.profiles import ProfilesRepository
 from app.repositories.threads import ThreadsRepository
 from app.repositories.users import UserRecord, UsersRepository
 from app.services.media import MediaService
+from app.services.posting_claims import PostingClaimsService
+from app.services.profile_moderation import ProfileModerationService
+from app.services.profiles import ProfilesService
+from app.services.self_delete import SelfDeleteService
 from app.services.spam import SpamService
 from app.services.staff import StaffService
 from app.services.threads import ThreadsService
@@ -107,12 +113,27 @@ def get_threads_service(
     # эти объекты лёгкие и не создают новое подключение к postgresql
     repository = ThreadsRepository(postgres_pool)
 
-    return ThreadsService(repository, site_settings, ws_manager)
+    claims = PostingClaimsService(postgres_pool, site_settings)
+    return ThreadsService(repository, site_settings, ws_manager, claims)
 
 
 type ThreadsServiceDependency = Annotated[
     ThreadsService,
     Depends(get_threads_service),
+]
+
+
+def get_posting_claims_service(
+    postgres_pool: PostgresPoolDependency, site_settings: SiteSettingsDependency
+) -> PostingClaimsService:
+    """создать service одноразовых прав подготовки медиа"""
+
+    return PostingClaimsService(postgres_pool, site_settings)
+
+
+type PostingClaimsServiceDependency = Annotated[
+    PostingClaimsService,
+    Depends(get_posting_claims_service),
 ]
 
 
@@ -140,6 +161,51 @@ def get_users_service(
 type UsersServiceDependency = Annotated[
     UsersService,
     Depends(get_users_service),
+]
+
+
+def get_profiles_service(
+    postgres_pool: PostgresPoolDependency,
+    site_settings: SiteSettingsDependency,
+) -> ProfilesService:
+    """создать сервис регистрации и profile-досок"""
+
+    return ProfilesService(
+        UsersRepository(postgres_pool),
+        ProfilesRepository(postgres_pool),
+        site_settings,
+    )
+
+
+type ProfilesServiceDependency = Annotated[
+    ProfilesService,
+    Depends(get_profiles_service),
+]
+
+
+def get_profile_moderation_service(
+    postgres_pool: PostgresPoolDependency,
+) -> ProfileModerationService:
+    """создать service owner-модерации без отдельной auth модели"""
+
+    return ProfileModerationService(postgres_pool)
+
+
+type ProfileModerationServiceDependency = Annotated[
+    ProfileModerationService,
+    Depends(get_profile_moderation_service),
+]
+
+
+def get_self_delete_service(postgres_pool: PostgresPoolDependency) -> SelfDeleteService:
+    """создать service self-delete с общими транзакционными репозиториями"""
+
+    return SelfDeleteService(postgres_pool)
+
+
+type SelfDeleteServiceDependency = Annotated[
+    SelfDeleteService,
+    Depends(get_self_delete_service),
 ]
 
 
@@ -171,9 +237,39 @@ async def get_current_user(request: Request) -> UserRecord:
     return user
 
 
+async def get_optional_current_user(request: Request) -> UserRecord | None:
+    """вернуть пользователя, но оставить anyone-публикации анонимными"""
+
+    token = request.cookies.get(SESSION_COOKIE)
+    if token is None:
+        return None
+    return await UsersRepository(request.app.state.postgres_pool).get_user_by_session(
+        hash_token(token)
+    )
+
+
+async def require_csrf(request: Request) -> None:
+    """проверить csrf-токен для изменения staff-состояния"""
+
+    # cookie приходит с браузером, а заголовок добавляет только наш клиент
+    cookie_token = request.cookies.get(CSRF_COOKIE)
+    header_token = request.headers.get(CSRF_HEADER)
+    if (
+        cookie_token is None
+        or header_token is None
+        or not compare_digest(cookie_token, header_token)
+    ):
+        raise HTTPException(status_code=403, detail="csrf validation failed")
+
+
 type CurrentUserDependency = Annotated[
     UserRecord,
     Depends(get_current_user),
+]
+
+type OptionalCurrentUserDependency = Annotated[
+    UserRecord | None,
+    Depends(get_optional_current_user),
 ]
 
 

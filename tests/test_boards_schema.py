@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from app.schemas.boards import BoardListResponse, BoardSummary
+from app.schemas.boards import BoardListResponse, BoardMediaOverrides, BoardSummary
 from app.schemas.threads import PostCreate, ThreadCreate
 
 
@@ -15,6 +15,9 @@ def test_board_summary_accepts_valid_slug() -> None:
         title="Моя доска",
         description="",
         is_nsfw=False,
+        thread_count=0,
+        post_count=0,
+        active_post_count=0,
     )
 
     assert board.slug == "my_board-2"
@@ -51,6 +54,15 @@ def test_board_list_response_is_empty_by_default() -> None:
     response = BoardListResponse()
 
     assert response.items == []
+
+
+def test_board_media_override_keeps_telegram_safe_values_available() -> None:
+    """доска может явно выбрать лимит альбома Telegram"""
+
+    overrides = BoardMediaOverrides(max_attachments_per_post=10, max_photo_size_mib=10)
+
+    assert overrides.max_attachments_per_post == 10
+    assert overrides.max_photo_size_mib == 10
 
 
 def test_thread_create_requires_opening_post() -> None:

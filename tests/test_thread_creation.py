@@ -37,6 +37,7 @@ class FakeConnection:
                 "is_archived": False,
                 "created_at": datetime(2026, 1, 1, tzinfo=UTC),
                 "bumped_at": datetime(2026, 1, 1, tzinfo=UTC),
+                "thread_number": 1,
             }
 
         if query == CREATE_POST_SQL:
@@ -81,5 +82,5 @@ async def test_create_thread_creates_opening_post_in_same_transaction() -> None:
     assert result.post.body == "первый пост"
     assert connection.calls == [
         (CREATE_THREAD_SQL, (5, "тест", False)),
-        (CREATE_POST_SQL, (12, "автор", "первый пост")),
+        (CREATE_POST_SQL, (12, "автор", "первый пост", None, None)),
     ]

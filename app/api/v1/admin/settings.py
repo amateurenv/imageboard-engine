@@ -1,8 +1,8 @@
 """административные маршруты для настроек сайта"""
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 
-from app.api.dependencies import OwnerUserDependency, StaffServiceDependency
+from app.api.dependencies import OwnerUserDependency, StaffServiceDependency, require_csrf
 from app.core.site_settings import SiteSettings
 
 router = APIRouter(
@@ -21,7 +21,7 @@ async def get_settings(
     return request.app.state.site_settings
 
 
-@router.put("", response_model=SiteSettings)
+@router.put("", response_model=SiteSettings, dependencies=[Depends(require_csrf)])
 async def update_settings(
     request: Request,
     settings: SiteSettings,

@@ -1,0 +1,9 @@
+[Unit]
+Description=Remove expired Imageboard staff sessions
+
+[Service]
+Type=oneshot
+User=imageboard
+WorkingDirectory=/srv/imageboard-engine
+EnvironmentFile=/etc/imageboard-engine.env
+ExecStart=/srv/imageboard-engine/.venv/bin/python -m scripts.cleanup_sessions

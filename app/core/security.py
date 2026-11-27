@@ -7,6 +7,8 @@ import bcrypt
 
 # имя куки сессионного токена
 SESSION_COOKIE = "session_token"
+CSRF_COOKIE = "csrf_token"
+CSRF_HEADER = "x-csrf-token"
 
 # сколько дней живёт сессия
 SESSION_TTL_SECONDS = 30 * 24 * 3600

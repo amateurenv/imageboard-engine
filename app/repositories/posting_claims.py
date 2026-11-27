@@ -1,0 +1,155 @@
+"""sql для одноразовых прав подготовки медиа"""
+
+# ruff: noqa: E501 - SQL-запросы оставлены целыми для безопасной проверки условий
+
+import json
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+
+from asyncpg import Connection, Pool, Record
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimBoard:
+    id: int
+    board_type: str
+    owner_user_id: int | None
+    thread_creation_policy: str
+    reply_policy: str
+    media_overrides: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class PostingClaim:
+    id: int
+    board_id: int
+    account_user_id: int | None
+    expires_at: datetime
+    consumed_at: datetime | None
+    max_attachments: int
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimMedia:
+    id: int
+    size: int
+    mime_type: str
+
+
+def _claim(row: Record) -> PostingClaim:
+    return PostingClaim(
+        row["id"], row["board_id"], row["account_user_id"], row["expires_at"],
+        row["consumed_at"], row["max_attachments"],
+    )
+
+
+class PostingClaimsRepository:
+    """блокировки claim и временных media внутри одной транзакции"""
+
+    def __init__(self, pool: Pool) -> None:
+        self._pool = pool
+
+    async def get_board(self, slug: str) -> ClaimBoard | None:
+        row = await self._pool.fetchrow(
+            """SELECT id, board_type, owner_user_id, thread_creation_policy, reply_policy,
+                      media_overrides
+               FROM boards WHERE slug=$1 AND is_active=TRUE""",
+            slug,
+        )
+        if row is None:
+            return None
+        raw = row["media_overrides"]
+        return ClaimBoard(
+            row["id"], row["board_type"], row["owner_user_id"],
+            row["thread_creation_policy"], row["reply_policy"],
+            raw if isinstance(raw, dict) else json.loads(raw),
+        )
+
+    async def get_board_by_thread(self, thread_id: int) -> ClaimBoard | None:
+        """получить доску треда для повторной проверки policy"""
+
+        row = await self._pool.fetchrow(
+            """SELECT b.id, b.board_type, b.owner_user_id, b.thread_creation_policy,
+                      b.reply_policy, b.media_overrides
+               FROM boards AS b JOIN threads AS t ON t.board_id=b.id
+               WHERE t.id=$1 AND b.is_active=TRUE""",
+            thread_id,
+        )
+        if row is None:
+            return None
+        raw = row["media_overrides"]
+        return ClaimBoard(
+            row["id"], row["board_type"], row["owner_user_id"],
+            row["thread_creation_policy"], row["reply_policy"],
+            raw if isinstance(raw, dict) else json.loads(raw),
+        )
+
+    async def create(
+        self, board_id: int, account_user_id: int | None, token_hash: str,
+        ttl: timedelta, max_attachments: int,
+    ) -> PostingClaim:
+        row = await self._pool.fetchrow(
+            """INSERT INTO posting_claims
+               (board_id, account_user_id, token_hash, expires_at, max_attachments)
+               VALUES ($1,$2,$3,clock_timestamp()+$4::interval,$5)
+               RETURNING id,board_id,account_user_id,expires_at,consumed_at,max_attachments""",
+            board_id, account_user_id, token_hash, ttl, max_attachments,
+        )
+        if row is None:
+            raise RuntimeError("posting claim not created")
+        return _claim(row)
+
+    async def lock_claim(self, connection: Connection, token_hash: str) -> PostingClaim | None:
+        row = await connection.fetchrow(
+            """SELECT id,board_id,account_user_id,expires_at,consumed_at,max_attachments
+               FROM posting_claims WHERE token_hash=$1 FOR UPDATE""", token_hash
+        )
+        return None if row is None else _claim(row)
+
+    async def lock_media(
+        self, connection: Connection, claim_id: int, board_id: int, media_ids: list[int]
+    ) -> list[ClaimMedia]:
+        rows = await connection.fetch(
+            """SELECT id,size,mime_type FROM media
+               WHERE id = ANY($1::bigint[]) AND posting_claim_id=$2 AND board_id=$3
+                 AND post_id IS NULL AND processing_state='ready'
+               ORDER BY array_position($1::bigint[], id) FOR UPDATE""",
+            media_ids, claim_id, board_id,
+        )
+        return [ClaimMedia(row["id"], row["size"], row["mime_type"]) for row in rows]
+
+    async def attach_and_consume(
+        self, connection: Connection, claim_id: int, post_id: int, media_ids: list[int]
+    ) -> None:
+        for position, media_id in enumerate(media_ids):
+            result = await connection.execute(
+                """UPDATE media SET post_id=$2, attachment_position=$3
+                   WHERE id=$1 AND posting_claim_id=$4 AND post_id IS NULL""",
+                media_id, post_id, position, claim_id,
+            )
+            if result != "UPDATE 1":
+                raise RuntimeError("media attachment changed during claim consumption")
+        result = await connection.execute(
+            "UPDATE posting_claims SET consumed_at=clock_timestamp() WHERE id=$1 AND consumed_at IS NULL",
+            claim_id,
+        )
+        if result != "UPDATE 1":
+            raise RuntimeError("posting claim already consumed")
+
+    async def cleanup_expired(self) -> int:
+        """удалить только неиспользованные media истёкших claims"""
+
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                result = await connection.execute(
+                    """WITH expired AS (
+                           SELECT id FROM posting_claims
+                           WHERE consumed_at IS NULL AND expires_at <= clock_timestamp()
+                           FOR UPDATE
+                       ), removed_media AS (
+                           DELETE FROM media WHERE posting_claim_id IN (SELECT id FROM expired)
+                           AND post_id IS NULL
+                       )
+                       DELETE FROM posting_claims WHERE id IN (SELECT id FROM expired)"""
+                )
+        return int(result.removeprefix("DELETE "))

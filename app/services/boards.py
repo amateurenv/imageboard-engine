@@ -3,11 +3,14 @@
 from dataclasses import asdict
 from typing import Protocol
 
+from app.core.site_settings import SiteSettings
+from app.core.urls import board_canonical_url
 from app.repositories.boards import BoardDetailRecord, BoardRecord
 from app.schemas.boards import (
     BoardCreate,
     BoardListResponse,
     BoardManagement,
+    BoardMediaOverrides,
     BoardSummary,
     BoardUpdate,
 )
@@ -16,11 +19,16 @@ from app.schemas.boards import (
 class BoardsReader(Protocol):
     """объект, который умеет читать и изменять доски"""
 
-    async def list_active_boards(self) -> list[BoardRecord]:
+    async def list_active_boards(self, activity_window_hours: int) -> list[BoardRecord]:
         """вернуть активные доски"""
 
     async def get_by_slug(self, slug: str) -> BoardDetailRecord | None:
         """вернуть доску по slug"""
+
+    async def get_active_board(
+        self, slug: str, activity_window_hours: int
+    ) -> BoardRecord | None:
+        """вернуть публичную доску с её счётчиками"""
 
     async def create_board(
         self,
@@ -31,6 +39,7 @@ class BoardsReader(Protocol):
         position: int,
         is_active: bool,
         is_nsfw: bool,
+        media_overrides: dict[str, object],
     ) -> BoardDetailRecord:
         """создать доску"""
 
@@ -43,6 +52,7 @@ class BoardsReader(Protocol):
         position: int,
         is_active: bool,
         is_nsfw: bool,
+        media_overrides: dict[str, object],
     ) -> BoardDetailRecord | None:
         """изменить доску"""
 
@@ -50,23 +60,30 @@ class BoardsReader(Protocol):
 class BoardsService:
     """подготовка досок для публичного api и управление ими"""
 
-    def __init__(self, boards_repository: BoardsReader) -> None:
+    def __init__(self, boards_repository: BoardsReader, site_settings: SiteSettings) -> None:
         # service зависит от нужного метода, а не от конкретной реализации
         self._boards_repository = boards_repository
+        self._site_settings = site_settings
 
     async def list_public_boards(self) -> BoardListResponse:
         """вернуть активные доски в безопасной форме api"""
 
-        # repository получает данные из postgresql
-        boards = await self._boards_repository.list_active_boards()
+        # передаём часы, а не готовую дату: postgres посчитает окно по своему времени
+        boards = await self._boards_repository.list_active_boards(
+            self._site_settings.statistics.activity_window_hours
+        )
 
-        # api получает только явно разрешённые публичные поля
+        # собираем ответ явно, чтобы случайно не показать staff-поля из базы
         items = [
             BoardSummary(
                 slug=board.slug,
                 title=board.title,
                 description=board.description,
                 is_nsfw=board.is_nsfw,
+                thread_count=board.thread_count,
+                post_count=board.post_count,
+                active_post_count=board.active_post_count,
+                canonical_url=board_canonical_url("public", board.slug),
             )
             for board in boards
         ]
@@ -76,7 +93,9 @@ class BoardsService:
     async def get_public_board(self, slug: str) -> BoardSummary | None:
         """вернуть публичные поля одной доски по slug"""
 
-        board = await self._boards_repository.get_by_slug(slug)
+        board = await self._boards_repository.get_active_board(
+            slug, self._site_settings.statistics.activity_window_hours
+        )
         if board is None:
             return None
 
@@ -85,6 +104,10 @@ class BoardsService:
             title=board.title,
             description=board.description,
             is_nsfw=board.is_nsfw,
+            thread_count=board.thread_count,
+            post_count=board.post_count,
+            active_post_count=board.active_post_count,
+            canonical_url=board_canonical_url("public", board.slug),
         )
 
     async def create_board(self, board_create: BoardCreate) -> BoardManagement:
@@ -97,6 +120,7 @@ class BoardsService:
             position=board_create.position,
             is_active=board_create.is_active,
             is_nsfw=board_create.is_nsfw,
+            media_overrides=board_create.media_overrides.model_dump(exclude_none=True),
         )
 
         return self._to_management(board)
@@ -128,4 +152,5 @@ class BoardsService:
             position=board.position,
             is_active=board.is_active,
             is_nsfw=board.is_nsfw,
+            media_overrides=BoardMediaOverrides.model_validate(board.media_overrides),
         )

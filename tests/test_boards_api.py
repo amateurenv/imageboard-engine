@@ -22,6 +22,10 @@ class FakeBoardsService:
                     title="Бред",
                     description="общение обо всём",
                     is_nsfw=False,
+                    thread_count=1,
+                    post_count=2,
+                    active_post_count=1,
+                    canonical_url="/b",
                 )
             ]
         )
@@ -59,6 +63,10 @@ async def test_list_boards_returns_public_data() -> None:
                 "title": "Бред",
                 "description": "общение обо всём",
                 "is_nsfw": False,
+                    "thread_count": 1,
+                    "post_count": 2,
+                    "active_post_count": 1,
+                    "canonical_url": "/b",
             }
         ]
     }

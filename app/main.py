@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from asyncpg import Pool
 from fastapi import FastAPI
 
+from app.api.admin_ui import router as admin_ui_router
 from app.api.system import router as system_router
 from app.api.v1.router import router as api_v1_router
 from app.core.config import get_settings
@@ -77,6 +78,8 @@ app = FastAPI(
 
 # подключаем служебные маршруты без версии
 app.include_router(system_router)
+# локальная админ-страница использует те же защищённые api-маршруты
+app.include_router(admin_ui_router)
 
 # подключаем первую версию публичного API
 app.include_router(api_v1_router)

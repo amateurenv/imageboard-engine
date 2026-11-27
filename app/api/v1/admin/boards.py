@@ -1,11 +1,12 @@
 """административные маршруты для досок"""
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 from app.api.dependencies import (
     AdminUserDependency,
     ModeratorUserDependency,
     StaffServiceDependency,
+    require_csrf,
 )
 from app.schemas.boards import BoardCreate, BoardManagement, BoardUpdate
 
@@ -25,7 +26,7 @@ async def list_boards(
     return await staff_service.list_boards()
 
 
-@router.post("", response_model=BoardManagement)
+@router.post("", response_model=BoardManagement, dependencies=[Depends(require_csrf)])
 async def create_board(
     board_create: BoardCreate,
     staff_service: StaffServiceDependency,
@@ -36,7 +37,7 @@ async def create_board(
     return await staff_service.create_board(board_create)
 
 
-@router.patch("/{slug}", response_model=BoardManagement)
+@router.patch("/{slug}", response_model=BoardManagement, dependencies=[Depends(require_csrf)])
 async def update_board(
     slug: str,
     board_update: BoardUpdate,
@@ -52,7 +53,7 @@ async def update_board(
     return updated
 
 
-@router.delete("/{slug}", status_code=204)
+@router.delete("/{slug}", status_code=204, dependencies=[Depends(require_csrf)])
 async def delete_board(
     slug: str,
     staff_service: StaffServiceDependency,

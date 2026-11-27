@@ -8,6 +8,8 @@ from app.core.site_settings import SiteSettings
 # окна действия лимитов в секундах
 THREADS_WINDOW_SECONDS = 24 * 60 * 60
 POSTS_WINDOW_SECONDS = 60 * 60
+DELETION_PASSWORD_WINDOW_SECONDS = 60 * 60
+DELETION_PASSWORD_MAX_ATTEMPTS = 5
 
 # lua выполняется в redis целиком, поэтому параллельные запросы не обходят лимит
 CHECK_AND_INCREMENT_SCRIPT = """
@@ -52,6 +54,16 @@ class SpamService:
             self._site_settings.post.max_posts_per_thread_hour,
             POSTS_WINDOW_SECONDS,
             "post creation limit exceeded",
+        )
+
+    async def check_deletion_password_limit(self, client_ip: str, target_id: int) -> None:
+        """ограничить перебор пароля удаления для одного объекта"""
+
+        await self._check_limit(
+            f"spam:deletion_password:{target_id}:{client_ip}",
+            DELETION_PASSWORD_MAX_ATTEMPTS,
+            DELETION_PASSWORD_WINDOW_SECONDS,
+            "deletion password rate limit exceeded",
         )
 
     async def _check_limit(self, key: str, limit: int, ttl: int, detail: str) -> None:

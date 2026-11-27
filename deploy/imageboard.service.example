@@ -1,0 +1,15 @@
+[Unit]
+Description=Imageboard Engine
+After=network.target
+
+[Service]
+Type=simple
+User=imageboard
+WorkingDirectory=/srv/imageboard-engine
+EnvironmentFile=/etc/imageboard-engine.env
+ExecStart=/srv/imageboard-engine/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

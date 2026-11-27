@@ -2,10 +2,10 @@
 
 # lru_cache сохраняет результат, Literal ограничивает список допустимых строк
 from functools import lru_cache
-from typing import Literal
+from typing import Literal, Self
 
 # BaseSettings читает переменные окружения, SettingsConfigDict задаёт правила
-from pydantic import PostgresDsn, RedisDsn
+from pydantic import PostgresDsn, RedisDsn, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -29,6 +29,15 @@ class Settings(BaseSettings):
     # адрес redis из REDIS_URL в .env
     redis_url: RedisDsn
 
+    @model_validator(mode="after")
+    def reject_debug_in_production(self) -> Self:
+        """запретить подробные ошибки в production"""
+
+        # traceback не должен попасть в ответ реальному посетителю
+        if self.app_env == "production" and self.app_debug:
+            raise ValueError("APP_DEBUG must be false when APP_ENV=production")
+        return self
+
     # правила чтения настроек
     model_config = SettingsConfigDict(
         # читать локальный .env, если он есть
@@ -47,4 +56,5 @@ def get_settings() -> Settings:
 
     # Settings читает .env и проверяет типы
     # noinspection PyArgumentList
-    return Settings()
+    # mypy не видит значения из .env, а pydantic проверит их при создании Settings
+    return Settings()  # type: ignore[call-arg]

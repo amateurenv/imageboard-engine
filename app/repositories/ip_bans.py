@@ -5,6 +5,10 @@ from datetime import datetime
 
 from asyncpg import Pool, Record
 
+
+class DuplicateIpBanError(Exception):
+    """ip уже находится в списке банов"""
+
 GET_BY_IP_SQL = """
 SELECT ip, reason, actor_id, created_at
 FROM ip_bans
@@ -20,6 +24,9 @@ ORDER BY created_at DESC
 CREATE_SQL = """
 INSERT INTO ip_bans (ip, reason, actor_id)
 VALUES ($1, $2, $3)
+-- повторный ban не меняет данные без явного решения модератора
+ON CONFLICT (ip) DO NOTHING
+RETURNING ip, reason, actor_id, created_at
 """
 
 DELETE_SQL = """
@@ -69,12 +76,11 @@ class IpBansRepository:
     async def create(self, ip: str, reason: str | None, actor_id: int | None) -> IpBanRecord:
         """забанить ip"""
 
-        await self._postgres_pool.execute(CREATE_SQL, ip, reason, actor_id)
-
-        record = await self.get_by_ip(ip)
+        # RETURNING сразу показывает повторный ban и не требует второго запроса
+        row = await self._postgres_pool.fetchrow(CREATE_SQL, ip, reason, actor_id)
+        record = None if row is None else _to_record(row)
         if record is None:
-            # insert без ошибки всегда возвращает строку
-            raise RuntimeError(f"ip ban not created: {ip}")
+            raise DuplicateIpBanError(ip)
 
         return record
 

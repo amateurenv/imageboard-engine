@@ -3,23 +3,24 @@
 from dataclasses import dataclass
 from datetime import datetime
 
-from asyncpg import Pool, Record
+from asyncpg import Connection, Pool, Record
 
 # треды доски: закреплённые выше обычных, остальные - по последнему ответу
 LIST_THREADS_PAGE_SQL = """
-SELECT id, subject, is_sticky, is_locked, is_archived, created_at, bumped_at
-FROM threads
-WHERE board_id = $1
-    AND is_archived = FALSE
+SELECT t.id, t.thread_number, t.subject, t.is_sticky, t.is_locked, t.is_archived,
+       t.created_at, t.bumped_at, b.slug AS board_slug, b.board_type
+FROM threads AS t JOIN boards AS b ON b.id = t.board_id
+WHERE t.board_id = $1
+    AND t.is_archived = FALSE AND t.is_hidden = FALSE
     AND (
         $2::boolean IS NULL
-        OR is_sticky < $2
+        OR t.is_sticky < $2
         OR (
-            is_sticky = $2
+            t.is_sticky = $2
             AND (bumped_at, id) < ($3::timestamptz, $4::bigint)
         )
     )
-ORDER BY is_sticky DESC, bumped_at DESC, id DESC
+ORDER BY t.is_sticky DESC, t.bumped_at DESC, t.id DESC
 LIMIT $5
 """
 
@@ -29,17 +30,33 @@ FROM boards
 WHERE slug = $1 AND is_active = TRUE
 """
 
+GET_BOARD_POSTING_SQL = """
+SELECT id, board_type, owner_user_id, thread_creation_policy, reply_policy
+FROM boards WHERE slug = $1 AND is_active = TRUE
+"""
+
+GET_THREAD_POSTING_SQL = """
+SELECT b.id, b.board_type, b.owner_user_id, b.thread_creation_policy, b.reply_policy
+FROM threads AS t JOIN boards AS b ON b.id = t.board_id
+WHERE t.id = $1 AND b.is_active = TRUE AND t.is_hidden = FALSE
+"""
+
 GET_THREAD_SQL = """
-SELECT t.id, t.subject, t.is_sticky, t.is_locked, t.is_archived, t.created_at, t.bumped_at
+SELECT t.id, t.thread_number, t.subject, t.is_sticky, t.is_locked, t.is_archived,
+       t.created_at, t.bumped_at, b.slug AS board_slug, b.board_type
 FROM threads AS t
 JOIN boards AS b ON b.id = t.board_id
 WHERE t.id = $1 AND b.is_active = TRUE
 """
 
+# публичное чтение не должно раскрывать скрытый тред, но модерации нужен полный запрос
+GET_VISIBLE_THREAD_SQL = f"{GET_THREAD_SQL.rstrip()} AND t.is_hidden = FALSE"
+
 GET_THREAD_OP_SQL = """
 SELECT id, author_name, body, created_at
 FROM posts
 WHERE thread_id = $1
+    AND is_hidden = FALSE
 ORDER BY id ASC
 LIMIT 1
 """
@@ -48,6 +65,7 @@ GET_THREAD_REPLIES_PAGE_SQL = """
 SELECT id, author_name, body, created_at
 FROM posts
 WHERE thread_id = $1
+    AND is_hidden = FALSE
     AND id > $2
     AND ($3::bigint IS NULL OR id < $3)
 ORDER BY id DESC
@@ -55,9 +73,15 @@ LIMIT $4
 """
 
 CREATE_THREAD_SQL = """
-INSERT INTO threads (board_id, subject, is_sticky)
-VALUES ($1, $2, $3)
-RETURNING id, subject, is_sticky, is_locked, is_archived, created_at, bumped_at
+WITH allocated_number AS (
+    UPDATE boards
+    SET next_thread_number = next_thread_number + 1
+    WHERE id = $1
+    RETURNING next_thread_number - 1 AS thread_number
+)
+INSERT INTO threads (board_id, thread_number, subject, is_sticky)
+SELECT $1, thread_number, $2, $3 FROM allocated_number
+RETURNING id, thread_number, subject, is_sticky, is_locked, is_archived, created_at, bumped_at
 """
 
 UPDATE_THREAD_SQL = """
@@ -68,9 +92,33 @@ RETURNING id, subject, is_sticky, is_locked, is_archived, created_at, bumped_at
 """
 
 CREATE_POST_SQL = """
-INSERT INTO posts (thread_id, author_name, body)
-VALUES ($1, $2, $3)
+INSERT INTO posts (thread_id, author_name, body, author_user_id, deletion_password_hash)
+VALUES ($1, $2, $3, $4, $5)
 RETURNING id, created_at
+"""
+
+GET_THREAD_SELF_DELETE_SQL = """
+SELECT t.id AS thread_id, t.board_id, p.id AS post_id, p.author_user_id,
+       p.deletion_password_hash
+FROM threads AS t
+JOIN LATERAL (
+    SELECT id, author_user_id, deletion_password_hash
+    FROM posts WHERE thread_id = t.id ORDER BY id ASC LIMIT 1
+) AS p ON TRUE
+WHERE t.id = $1
+FOR UPDATE OF t, p
+"""
+
+GET_POST_SELF_DELETE_SQL = """
+SELECT p.id AS post_id, p.thread_id, t.board_id, p.author_user_id,
+       p.deletion_password_hash,
+       p.id = (
+           SELECT id FROM posts WHERE thread_id = p.thread_id ORDER BY id ASC LIMIT 1
+       ) AS is_opening
+FROM posts AS p
+JOIN threads AS t ON t.id = p.thread_id
+WHERE p.id = $1
+FOR UPDATE OF p, t
 """
 
 LOCK_THREAD_FOR_POST_SQL = """
@@ -102,6 +150,20 @@ class ThreadRecord:
     is_archived: bool
     created_at: datetime
     bumped_at: datetime
+    thread_number: int = 0
+    board_slug: str = ""
+    board_type: str = "public"
+
+
+@dataclass(frozen=True, slots=True)
+class PostingBoardRecord:
+    """данные доски, нужные только для проверки policy публикации"""
+
+    id: int
+    board_type: str
+    owner_user_id: int | None
+    thread_creation_policy: str
+    reply_policy: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +182,29 @@ class PostCreationResult:
 
     post: PostRecord
     was_bumped: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SelfDeleteThreadRecord:
+    """минимум данных для проверки удаления треда"""
+
+    thread_id: int
+    board_id: int
+    post_id: int
+    author_user_id: int | None
+    deletion_password_hash: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class SelfDeletePostRecord:
+    """минимум данных для проверки удаления одного ответа"""
+
+    post_id: int
+    thread_id: int
+    board_id: int
+    author_user_id: int | None
+    deletion_password_hash: str | None
+    is_opening: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,7 +235,19 @@ def _thread_record(row: Record) -> ThreadRecord:
         is_archived=row["is_archived"],
         created_at=row["created_at"],
         bumped_at=row["bumped_at"],
+        thread_number=row["thread_number"],
+        board_slug=_optional_row_value(row, "board_slug", ""),
+        board_type=_optional_row_value(row, "board_type", "public"),
     )
+
+
+def _optional_row_value(row: Record, key: str, default: str) -> str:
+    """прочитать поле join, сохранив совместимость старого unit-теста"""
+
+    try:
+        return row[key]
+    except KeyError:
+        return default
 
 
 def _post_record(row: Record) -> PostRecord:
@@ -177,6 +274,18 @@ class ThreadsRepository:
         row = await self._postgres_pool.fetchrow(GET_BOARD_ID_BY_SLUG_SQL, slug)
         return None if row is None else row["id"]
 
+    async def get_board_posting(self, slug: str) -> PostingBoardRecord | None:
+        """прочитать policy доски перед созданием треда"""
+
+        row = await self._postgres_pool.fetchrow(GET_BOARD_POSTING_SQL, slug)
+        return None if row is None else PostingBoardRecord(**dict(row))
+
+    async def get_thread_posting(self, thread_id: int) -> PostingBoardRecord | None:
+        """прочитать policy доски треда перед созданием ответа"""
+
+        row = await self._postgres_pool.fetchrow(GET_THREAD_POSTING_SQL, thread_id)
+        return None if row is None else PostingBoardRecord(**dict(row))
+
     async def list_threads_page(
         self,
         *,
@@ -201,7 +310,15 @@ class ThreadsRepository:
     async def get_thread(self, thread_id: int) -> ThreadRecord | None:
         """вернуть тред по id, None если нет"""
 
-        row = await self._postgres_pool.fetchrow(GET_THREAD_SQL, thread_id)
+        row = await self._postgres_pool.fetchrow(GET_VISIBLE_THREAD_SQL, thread_id)
+        return None if row is None else _thread_record(row)
+
+    async def get_thread_for_update(
+        self, connection: Connection, thread_id: int
+    ) -> ThreadRecord | None:
+        """прочитать тред с блокировкой для частичного изменения"""
+
+        row = await connection.fetchrow(f"{GET_THREAD_SQL} FOR UPDATE", thread_id)
         return None if row is None else _thread_record(row)
 
     async def get_thread_page(
@@ -216,7 +333,7 @@ class ThreadsRepository:
         # один снимок чтения не даст вернуть удалённый тред с чужими постами
         async with self._postgres_pool.acquire() as connection:
             async with connection.transaction(isolation="repeatable_read", readonly=True):
-                thread_row = await connection.fetchrow(GET_THREAD_SQL, thread_id)
+                thread_row = await connection.fetchrow(GET_VISIBLE_THREAD_SQL, thread_id)
                 if thread_row is None:
                     return None
 
@@ -246,31 +363,49 @@ class ThreadsRepository:
         subject: str,
         author_name: str | None,
         body: str,
+        author_user_id: int | None = None,
+        deletion_password_hash: str | None = None,
     ) -> ThreadCreationResult:
         """создать тред и первый пост в одной транзакции"""
 
         async with self._postgres_pool.acquire() as connection:
             async with connection.transaction():
-                thread_row = await connection.fetchrow(
-                    CREATE_THREAD_SQL,
-                    board_id,
-                    subject,
-                    False,
+                return await self.create_thread_in_transaction(
+                    connection,
+                    board_id=board_id,
+                    subject=subject,
+                    author_name=author_name,
+                    body=body,
+                    author_user_id=author_user_id,
+                    deletion_password_hash=deletion_password_hash,
                 )
-                if thread_row is None:
-                    # insert без ошибки всегда возвращает строку
-                    raise RuntimeError(f"thread not created: board_id={board_id}")
 
-                post_row = await connection.fetchrow(
-                    CREATE_POST_SQL,
-                    thread_row["id"],
-                    author_name,
-                    body,
-                )
-                if post_row is None:
-                    # этот случай защищает от неполного ответа драйвера или базы
-                    raise RuntimeError(f"opening post not created: thread_id={thread_row['id']}")
+    async def create_thread_in_transaction(
+        self,
+        connection: Connection,
+        *,
+        board_id: int,
+        subject: str,
+        author_name: str | None,
+        body: str,
+        author_user_id: int | None,
+        deletion_password_hash: str | None,
+    ) -> ThreadCreationResult:
+        """создать тред внутри внешней транзакции claim или moderation"""
 
+        thread_row = await connection.fetchrow(CREATE_THREAD_SQL, board_id, subject, False)
+        if thread_row is None:
+            raise RuntimeError(f"thread not created: board_id={board_id}")
+        post_row = await connection.fetchrow(
+            CREATE_POST_SQL,
+            thread_row["id"],
+            author_name,
+            body,
+            author_user_id,
+            deletion_password_hash,
+        )
+        if post_row is None:
+            raise RuntimeError(f"opening post not created: thread_id={thread_row['id']}")
         return ThreadCreationResult(
             thread=_thread_record(thread_row),
             post=PostRecord(
@@ -288,6 +423,8 @@ class ThreadsRepository:
         author_name: str | None,
         body: str,
         reference_ids: list[int],
+        author_user_id: int | None = None,
+        deletion_password_hash: str | None = None,
     ) -> PostCreationResult | None:
         """создать пост и поднять доступный тред в одной транзакции"""
 
@@ -304,28 +441,41 @@ class ThreadsRepository:
                 if thread_row["is_archived"]:
                     raise ValueError("thread is archived")
 
-                post_row = await connection.fetchrow(
-                    CREATE_POST_SQL, thread_id, author_name, body
+                return await self.create_post_in_transaction(
+                    connection,
+                    thread_id=thread_id,
+                    author_name=author_name,
+                    body=body,
+                    reference_ids=reference_ids,
+                    author_user_id=author_user_id,
+                    deletion_password_hash=deletion_password_hash,
                 )
 
-                # архивные треды выше уже отклонены, поэтому успешный пост всегда bump
-                await connection.execute(BUMP_THREAD_SQL, thread_id)
+    async def create_post_in_transaction(
+        self,
+        connection: Connection,
+        *,
+        thread_id: int,
+        author_name: str | None,
+        body: str,
+        reference_ids: list[int],
+        author_user_id: int | None,
+        deletion_password_hash: str | None,
+    ) -> PostCreationResult:
+        """создать ответ внутри уже заблокированной транзакции"""
 
-                if reference_ids:
-                    # ссылки ведём только на посты, которые уже есть в базе
-                    existing_rows = await connection.fetch(
-                        "SELECT id FROM posts WHERE id = ANY($1::bigint[])",
-                        reference_ids,
-                    )
-                    existing_ids = {row["id"] for row in existing_rows}
-                    for target_id in reference_ids:
-                        if target_id in existing_ids and target_id != post_row["id"]:
-                            await connection.execute(
-                                INSERT_POST_REFERENCE_SQL,
-                                post_row["id"],
-                                target_id,
-                            )
-
+        post_row = await connection.fetchrow(
+            CREATE_POST_SQL, thread_id, author_name, body, author_user_id, deletion_password_hash
+        )
+        await connection.execute(BUMP_THREAD_SQL, thread_id)
+        if reference_ids:
+            existing_rows = await connection.fetch(
+                "SELECT id FROM posts WHERE id = ANY($1::bigint[])", reference_ids
+            )
+            existing_ids = {row["id"] for row in existing_rows}
+            for target_id in reference_ids:
+                if target_id in existing_ids and target_id != post_row["id"]:
+                    await connection.execute(INSERT_POST_REFERENCE_SQL, post_row["id"], target_id)
         return PostCreationResult(
             post=PostRecord(
                 id=post_row["id"],
@@ -334,6 +484,39 @@ class ThreadsRepository:
                 created_at=post_row["created_at"],
             ),
             was_bumped=True,
+        )
+
+    async def get_thread_for_self_delete(
+        self, connection: Connection, thread_id: int
+    ) -> SelfDeleteThreadRecord | None:
+        """заблокировать тред и его op перед проверкой автора"""
+
+        row = await connection.fetchrow(GET_THREAD_SELF_DELETE_SQL, thread_id)
+        if row is None:
+            return None
+        return SelfDeleteThreadRecord(
+            thread_id=row["thread_id"],
+            board_id=row["board_id"],
+            post_id=row["post_id"],
+            author_user_id=row["author_user_id"],
+            deletion_password_hash=row["deletion_password_hash"],
+        )
+
+    async def get_post_for_self_delete(
+        self, connection: Connection, post_id: int
+    ) -> SelfDeletePostRecord | None:
+        """заблокировать ответ и тред, чтобы op не сменился в гонке"""
+
+        row = await connection.fetchrow(GET_POST_SELF_DELETE_SQL, post_id)
+        if row is None:
+            return None
+        return SelfDeletePostRecord(
+            post_id=row["post_id"],
+            thread_id=row["thread_id"],
+            board_id=row["board_id"],
+            author_user_id=row["author_user_id"],
+            deletion_password_hash=row["deletion_password_hash"],
+            is_opening=row["is_opening"],
         )
 
     async def update_thread(
@@ -352,12 +535,33 @@ class ThreadsRepository:
         )
         return None if row is None else _thread_record(row)
 
+    async def update_thread_in_transaction(
+        self, connection: Connection, **values: object
+    ) -> ThreadRecord | None:
+        """изменить тред уже внутри внешней транзакции"""
+
+        row = await connection.fetchrow(
+            UPDATE_THREAD_SQL,
+            values["thread_id"],
+            values["subject"],
+            values["is_sticky"],
+            values["is_locked"],
+            values["is_archived"],
+        )
+        return None if row is None else _thread_record(row)
+
     async def delete_thread(self, thread_id: int) -> bool:
         """удалить тред, вернуть есть ли такой"""
 
         row = await self._postgres_pool.fetchrow(
             "DELETE FROM threads WHERE id = $1 RETURNING id", thread_id
         )
+        return row is not None
+
+    async def delete_thread_in_transaction(self, connection: Connection, thread_id: int) -> bool:
+        """удалить тред уже внутри внешней транзакции"""
+
+        row = await connection.fetchrow("DELETE FROM threads WHERE id = $1 RETURNING id", thread_id)
         return row is not None
 
     async def delete_post(self, post_id: int) -> bool:
@@ -367,3 +571,40 @@ class ThreadsRepository:
             "DELETE FROM posts WHERE id = $1 RETURNING id", post_id
         )
         return row is not None
+
+    async def delete_non_opening_post_in_transaction(
+        self, connection: Connection, post_id: int
+    ) -> bool:
+        """удалить пост, но запретить удаление первого поста треда"""
+
+        row = await connection.fetchrow(
+            """
+            WITH target AS (
+                SELECT id, thread_id FROM posts WHERE id = $1 FOR UPDATE
+            ), opening_post AS (
+                SELECT id FROM posts WHERE thread_id = (SELECT thread_id FROM target)
+                ORDER BY id ASC LIMIT 1
+            )
+            DELETE FROM posts
+            WHERE id = (SELECT id FROM target) AND id <> (SELECT id FROM opening_post)
+            RETURNING id
+            """,
+            post_id,
+        )
+        return row is not None
+
+    async def is_opening_post_in_transaction(
+        self, connection: Connection, post_id: int
+    ) -> bool:
+        """проверить, является ли пост первым в треде"""
+
+        row = await connection.fetchrow(
+            """
+            SELECT p.id = (
+                SELECT id FROM posts WHERE thread_id = p.thread_id ORDER BY id ASC LIMIT 1
+            ) AS is_opening
+            FROM posts AS p WHERE p.id = $1 FOR UPDATE
+            """,
+            post_id,
+        )
+        return row is not None and row["is_opening"]

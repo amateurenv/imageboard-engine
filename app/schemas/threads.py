@@ -12,6 +12,7 @@ class ThreadSummary(BaseModel):
     subject: str
     is_sticky: bool
     bumped_at: datetime
+    canonical_url: str = ""
 
 
 class ThreadListResponse(BaseModel):
@@ -33,6 +34,7 @@ class ThreadDetail(BaseModel):
     is_archived: bool
     created_at: datetime
     bumped_at: datetime
+    canonical_url: str = ""
 
 
 class PostSummary(BaseModel):
@@ -43,6 +45,7 @@ class PostSummary(BaseModel):
     author_name: str
     body: str
     created_at: datetime
+    thread_canonical_url: str = ""
 
 
 class ThreadWithPosts(BaseModel):
@@ -82,6 +85,11 @@ class ThreadCreate(BaseModel):
     # тред без первого поста не создаём
     body: str = Field(min_length=1, max_length=100000)
 
+    # аноним хранит пароль только для будущего self-delete, не для входа
+    deletion_password: str | None = None
+    posting_claim_token: str | None = None
+    media_ids: list[int] = Field(default_factory=list, max_length=20)
+
 
 class PostCreate(BaseModel):
     """создать пост в треде (данные из запроса)"""
@@ -93,3 +101,16 @@ class PostCreate(BaseModel):
     author_name: str | None = Field(default=None, max_length=500)
     # без медиа пустой текст не имеет смысла
     body: str = Field(min_length=1, max_length=100000)
+
+    # для анонима обязателен, для вошедшего пользователя намеренно игнорируется
+    deletion_password: str | None = None
+    posting_claim_token: str | None = None
+    media_ids: list[int] = Field(default_factory=list, max_length=20)
+
+
+class SelfDeleteRequest(BaseModel):
+    """тело self-delete без передачи пароля через url"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    deletion_password: str | None = None

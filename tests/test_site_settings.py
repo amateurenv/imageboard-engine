@@ -16,6 +16,13 @@ def test_default_site_settings() -> None:
     assert settings.post.max_post_length == 10000
     assert settings.post.max_author_name_length == 50
     assert settings.post.max_posts_per_thread_hour == 10
+    assert settings.media.max_attachments_per_post == 10
+    assert settings.media.max_attachment_size_mib == 20
+    assert settings.media.max_photo_size_mib == 20
+    assert settings.media.max_other_media_size_mib == 20
+    assert settings.media.max_total_size_mib == 200
+    assert settings.media.allow_anonymous_uploads is True
+    assert settings.statistics.activity_window_hours == 24
     assert settings.localization.default_locale == "ru"
     assert settings.localization.anonymous_name == "Аноним"
     assert settings.appearance.active_theme == "dark"
@@ -45,3 +52,10 @@ def test_site_settings_reject_unknown_setting() -> None:
                 }
             }
         )
+
+
+def test_site_settings_rejects_unsafe_media_ceiling() -> None:
+    """глобальный лимит не даёт случайно разрешить бесконечный upload"""
+
+    with pytest.raises(ValidationError):
+        SiteSettings.model_validate({"media": {"max_attachments_per_post": 21}})

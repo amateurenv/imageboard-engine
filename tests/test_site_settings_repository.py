@@ -128,5 +128,6 @@ async def test_save_site_settings_uses_one_transaction() -> None:
     await save_site_settings(pool, get_default_site_settings())
 
     assert pool.connection.transactions == 1
-    assert len(pool.connection.executed) == 5
+    # identifiers сохраняются отдельной группой рядом с media и остальными настройками
+    assert len(pool.connection.executed) == 9
     assert all("updated_at = now()" in query for query, _ in pool.connection.executed)

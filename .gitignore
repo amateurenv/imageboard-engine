@@ -13,6 +13,7 @@ htmlcov/
 .env
 .env.*
 !.env.example
+!.env.test.example
 docker-compose.override.yml
 
 # Local databases
@@ -25,6 +26,13 @@ redis-data/
 uploads/
 media/
 *.log
+
+# Local backups and portable archives
+*.dump
+*.pgdump
+*.sql.gz
+*.bak
+backups/
 
 # IDE and OS
 .idea/

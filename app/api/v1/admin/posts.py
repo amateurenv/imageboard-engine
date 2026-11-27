@@ -1,8 +1,8 @@
 """административный маршрут для удаления постов"""
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, HTTPException
 
-from app.api.dependencies import ModeratorUserDependency, StaffServiceDependency
+from app.api.dependencies import ModeratorUserDependency, StaffServiceDependency, require_csrf
 
 router = APIRouter(
     prefix="/admin/posts",
@@ -10,7 +10,7 @@ router = APIRouter(
 )
 
 
-@router.delete("/{post_id}", status_code=204)
+@router.delete("/{post_id}", status_code=204, dependencies=[Depends(require_csrf)])
 async def delete_post(
     post_id: int,
     staff_service: StaffServiceDependency,
@@ -18,4 +18,7 @@ async def delete_post(
 ) -> None:
     """удалить пост"""
 
-    await staff_service.delete_post(moderator_user.id, post_id)
+    try:
+        await staff_service.delete_post(moderator_user.id, post_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc

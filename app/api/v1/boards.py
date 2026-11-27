@@ -6,7 +6,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from app.api.dependencies import (
     IpBansRepositoryDependency,
+    OptionalCurrentUserDependency,
     PostgresPoolDependency,
+    SiteSettingsDependency,
     SpamServiceDependency,
     ThreadsServiceDependency,
     check_ip_bans,
@@ -17,6 +19,10 @@ from app.repositories.boards import BoardsRepository
 from app.schemas.boards import BoardListResponse, BoardSummary
 from app.schemas.threads import ThreadCreate, ThreadListResponse, ThreadWithPosts
 from app.services.boards import BoardsService
+from app.services.media_policy import MediaPolicyError
+from app.services.posting_claims import PostingClaimError
+from app.services.posting_policy import PostingPermissionError
+from app.services.threads import DeletionPasswordError
 
 # все маршруты этого модуля начинаются с /boards
 router = APIRouter(
@@ -26,13 +32,14 @@ router = APIRouter(
 
 def get_boards_service(
     postgres_pool: PostgresPoolDependency,
+    site_settings: SiteSettingsDependency,
 ) -> BoardsService:
     """создать service для одного http-запроса"""
 
     # эти объекты лёгкие и не создают новое подключение к postgresql
     repository = BoardsRepository(postgres_pool)
 
-    return BoardsService(repository)
+    return BoardsService(repository, site_settings)
 
 # fastapi вызовет get_boards_service и передаст результат в маршрут
 type BoardsServiceDependency = Annotated[
@@ -96,6 +103,7 @@ async def create_thread(
     threads_service: ThreadsServiceDependency,
     ip_bans_repository: IpBansRepositoryDependency,
     spam_service: SpamServiceDependency,
+    current_user: OptionalCurrentUserDependency,
 ) -> ThreadWithPosts | None:
     """создать тред с первым постом"""
 
@@ -106,7 +114,21 @@ async def create_thread(
     await spam_service.check_thread_limit(get_client_ip(request), slug)
 
     try:
-        thread = await threads_service.create_thread(slug, thread_create)
+        thread = await threads_service.create_thread(slug, thread_create, current_user)
+    except PostingPermissionError as exc:
+        raise HTTPException(
+            status_code=exc.http_status,
+            detail={"code": exc.code.value, "message": str(exc)},
+        ) from exc
+    except DeletionPasswordError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": exc.code, "message": "deletion password is required"},
+        ) from exc
+    except PostingClaimError as exc:
+        raise HTTPException(status_code=exc.status_code, detail={"code": exc.code}) from exc
+    except MediaPolicyError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.to_detail()) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

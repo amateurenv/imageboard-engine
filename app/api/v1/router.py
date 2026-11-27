@@ -9,6 +9,9 @@ from app.api.v1.admin.settings import router as admin_settings_router
 from app.api.v1.admin.threads import router as admin_threads_router
 from app.api.v1.auth import router as auth_router
 from app.api.v1.boards import router as boards_router
+from app.api.v1.posting_claims import router as posting_claims_router
+from app.api.v1.posts import router as posts_router
+from app.api.v1.profiles import router as profiles_router
 from app.api.v1.threads import router as threads_router
 
 # все пользовательские маршруты первой версии начинаются с /api/v1
@@ -16,9 +19,12 @@ router = APIRouter(prefix="/api/v1")
 
 # добавляем маршруты авторизации
 router.include_router(auth_router)
+router.include_router(profiles_router)
 # добавляем маршруты досок и тредов к первой версии api
 router.include_router(boards_router)
+router.include_router(posting_claims_router)
 router.include_router(threads_router)
+router.include_router(posts_router)
 # медиа и realtime временно выключены до отдельной безопасной переработки
 # добавляем административные маршруты
 router.include_router(admin_boards_router)

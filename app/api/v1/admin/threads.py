@@ -1,8 +1,8 @@
 """административные маршруты для тредов"""
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
-from app.api.dependencies import ModeratorUserDependency, StaffServiceDependency
+from app.api.dependencies import ModeratorUserDependency, StaffServiceDependency, require_csrf
 from app.schemas.staff import ThreadUpdateAdmin
 from app.schemas.threads import ThreadDetail
 
@@ -12,7 +12,7 @@ router = APIRouter(
 )
 
 
-@router.patch("/{thread_id}", response_model=ThreadDetail)
+@router.patch("/{thread_id}", response_model=ThreadDetail, dependencies=[Depends(require_csrf)])
 async def update_thread(
     thread_id: int,
     update: ThreadUpdateAdmin,
@@ -28,7 +28,7 @@ async def update_thread(
     return updated
 
 
-@router.delete("/{thread_id}", status_code=204)
+@router.delete("/{thread_id}", status_code=204, dependencies=[Depends(require_csrf)])
 async def delete_thread(
     thread_id: int,
     staff_service: StaffServiceDependency,
