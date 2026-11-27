@@ -136,7 +136,8 @@ class PostingClaimsService:
         if len(media_ids) > claim.max_attachments:
             raise PostingClaimError("media_count_exceeded")
         media = await self._claims.lock_media(connection, claim.id, board.id, media_ids)
-        if len(media) != len(media_ids):
+        # даже готовый кружок требует доверенного источника публикации
+        if len(media) != len(media_ids) or any(item.media_kind == "video_note" for item in media):
             raise PostingClaimError("posting_claim_media_invalid", 403)
         self._policy(board).validate(
             [
@@ -161,6 +162,8 @@ class PostingClaimsService:
 
     @staticmethod
     def _media_type(mime_type: str, is_animation: bool, media_kind: str) -> MediaType:
+        if media_kind == "video":
+            return MediaType.VIDEO
         if media_kind == "audio":
             return MediaType.AUDIO
         if media_kind == "voice":

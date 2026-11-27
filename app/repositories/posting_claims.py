@@ -101,6 +101,15 @@ class PostingClaimsRepository:
             raise RuntimeError("posting claim not created")
         return _claim(row)
 
+    async def get_claim(self, token_hash: str) -> PostingClaim | None:
+        """прочитать claim перед проверкой содержимого файла"""
+
+        row = await self._pool.fetchrow(
+            """SELECT id,board_id,account_user_id,expires_at,consumed_at,max_attachments
+               FROM posting_claims WHERE token_hash=$1""", token_hash,
+        )
+        return None if row is None else _claim(row)
+
     async def lock_claim(self, connection: Connection, token_hash: str) -> PostingClaim | None:
         row = await connection.fetchrow(
             """SELECT id,board_id,account_user_id,expires_at,consumed_at,max_attachments
@@ -179,6 +188,11 @@ class PostingClaimsRepository:
                            WHEN media.media_kind IN ('audio', 'voice')
                             AND media.canonical_path IS NOT NULL
                             AND media.canonical_mime_type IS NOT NULL
+                           THEN $5
+                           WHEN media.media_kind IN ('video', 'video_note')
+                            AND media.canonical_path IS NOT NULL
+                            AND media.canonical_mime_type = 'video/mp4'
+                            AND media.preview_path IS NOT NULL
                            THEN $5
                            ELSE NULL
                        END

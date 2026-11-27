@@ -361,14 +361,16 @@ class ThreadsService:
                 PublicMediaUrls(
                     media_kind=item.media_kind,
                     preview_url=(
-                        f"/media/{item.public_key}/preview" if item.media_kind == "image" else None
+                        f"/media/{item.public_key}/preview"
+                        if item.media_kind in {"image", "video", "video_note"}
+                        else None
                     ),
                     display_url=(
                         f"/media/{item.public_key}/display" if item.media_kind == "image" else None
                     ),
                     content_url=(
                         f"/media/{item.public_key}/content"
-                        if item.media_kind in {"audio", "voice"}
+                        if item.media_kind in {"audio", "voice", "video", "video_note"}
                         else None
                     ),
                     mime_type=item.canonical_mime_type or "image/webp",

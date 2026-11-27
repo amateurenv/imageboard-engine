@@ -5,12 +5,13 @@ import json
 import os
 import subprocess
 import uuid
+from datetime import timedelta
 from io import BytesIO
 from pathlib import Path
 
 import asyncpg
 import pytest
-from httpx import ASGITransport, AsyncClient
+from httpx import ASGITransport, AsyncClient, Response
 from PIL import Image
 from redis.asyncio import Redis
 
@@ -26,8 +27,9 @@ from app.main import app
 from app.repositories.media import MediaRepository
 from app.repositories.posting_claims import PostingClaimsRepository
 from app.repositories.users import UsersRepository
-from app.services.media_policy import MediaPolicyError
+from app.services.media_policy import MEBIBYTE, MediaPolicyError, MediaType
 from app.services.media_storage import MediaStorage
+from app.services.video_processing import VideoProcessor
 from app.ws.manager import DisabledWebSocketManager
 from scripts.cleanup_media_files import cleanup_media_files
 from scripts.media_worker import MAX_PROCESSING_ATTEMPTS, PROCESSING_LEASE, process_job
@@ -740,13 +742,13 @@ async def test_image_upload_quarantine_worker_attach_and_cleanup(http_client: As
         assert response.json()["processing_state"] == "queued"
         uploads.append(response.json()["id"])
 
-    unsupported = await http_client.post(
+    broken_mp4 = await http_client.post(
         f"/api/v1/boards/{board_slug}/media",
         data={"posting_claim_token": token},
         files={"file": ("video.mp4", b"\x00\x00\x00\x18ftypisom", "video/mp4")},
     )
-    assert unsupported.status_code == 415
-    assert unsupported.json()["detail"]["code"] == "unsupported_media_type"
+    assert broken_mp4.status_code == 422
+    assert broken_mp4.json()["detail"]["code"] == "invalid_media"
     for payload in [
         b"RIFF\x00\x00\x00\x00WAVE",
         b"fLaC\x00\x00\x00\x22",
@@ -1070,6 +1072,7 @@ async def test_media_delivery_closes_after_profile_hide_and_delete(
     )
     assert hidden_thread.status_code == 200
     assert (await http_client.get(thread_url)).status_code == 404
+
     restored_thread = await http_client.patch(
         f"/api/v1/profiles/alice/threads/{thread_id}",
         headers=csrf,
@@ -1106,3 +1109,392 @@ async def test_media_delivery_closes_after_profile_hide_and_delete(
     )
     assert deleted_thread.status_code == 204
     assert (await http_client.get(thread_url)).status_code == 404
+
+
+def make_video_file(
+    path: Path, *, size: str = "160x120", fps: int = 24, duration: int = 1,
+    audio: bool = False, codec: str = "libx264",
+) -> bytes:
+    """создать короткий MP4 с настоящим потоком и предсказуемой metadata"""
+
+    audio_args = (
+        ["-f", "lavfi", "-i", f"sine=frequency=440:duration={duration}", "-c:a", "aac"]
+        if audio else []
+    )
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-nostdin", "-y",
+            "-f", "lavfi", "-i", f"color=red:s={size}:r={fps}:d={duration}", *audio_args,
+            "-metadata", "title=private tag", "-metadata:s:v:0", "handler_name=private handler",
+            "-c:v", codec, "-threads", "1", "-pix_fmt", "yuv420p", str(path),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=20,
+    )
+    return path.read_bytes()
+
+
+async def upload_video(
+    client: AsyncClient, board: str, token: str, payload: bytes,
+) -> Response:
+    """публичная форма не может задать тип даже для квадратного MP4"""
+
+    return await client.post(
+        f"/api/v1/boards/{board}/media",
+        data={"posting_claim_token": token, "media_kind": "video_note"},
+        files={"file": ("note.png", payload, "image/png")},
+    )
+
+
+@pytest.mark.anyio
+async def test_video_upload_worker_visibility_and_cleanup(
+    http_client: AsyncClient, tmp_path: Path,
+) -> None:
+    """обычный и квадратный MP4 проходят общий lifecycle с настоящим FFmpeg"""
+
+    await register(http_client, "alice")
+    csrf = await login(http_client, "alice", "profile-password")
+    claim = await http_client.post("/api/v1/boards/alice/posting-claims")
+    assert claim.status_code == 201
+    token = claim.json()["token"]
+    repository = MediaRepository(app.state.postgres_pool)
+    storage = MediaStorage(app.state.media_storage_root)
+    media_ids = []
+    for audio, dimensions in [(True, "1920x1080"), (False, "160x160")]:
+        src = make_video_file(tmp_path / "source.mp4", size=dimensions, audio=audio)
+        uploaded = await upload_video(http_client, "alice", token, src)
+        assert uploaded.status_code == 201, uploaded.text
+        assert uploaded.json()["media_kind"] == "video"
+        assert uploaded.json()["mime_type"] == "video/mp4"
+        assert not {"path", "content_url", "preview_url"} & uploaded.json().keys()
+        media_id = uploaded.json()["id"]
+        media_ids.append(media_id)
+        premature = await http_client.post(
+            "/api/v1/boards/alice/threads",
+            json={"body": "test", "posting_claim_token": token, "media_ids": [media_id]},
+        )
+        assert premature.status_code == 403
+        assert premature.json()["detail"]["code"] == "posting_claim_media_invalid"
+
+        claimed = await repository.claim_by_id(
+            media_id, max_attempts=MAX_PROCESSING_ATTEMPTS, lease_duration=PROCESSING_LEASE,
+        )
+        assert claimed is not None
+        assert claimed.sample_rate == (44_100 if audio else None)
+        await process_job(repository, media_id, storage)
+        ready = await repository.get_by_id(media_id)
+        assert ready is not None and ready.processing_state.value == "ready"
+        assert ready.canonical_path and ready.preview_path
+        assert ready.channels == (1 if audio else None)
+        assert ready.sample_rate == (48_000 if audio else None)
+        canonical = storage.resolve(ready.canonical_path)
+        payload = json.loads(subprocess.check_output(
+            ["ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json",
+             str(canonical)], timeout=10,
+        ))
+        codecs = [stream["codec_name"] for stream in payload["streams"]]
+        assert codecs == (["h264", "aac"] if audio else ["h264"])
+        if audio:
+            assert payload["streams"][1]["profile"] == "LC"
+            assert int(payload["streams"][1]["sample_rate"]) == ready.sample_rate
+        assert payload["streams"][0]["pix_fmt"] == "yuv420p"
+        assert payload["streams"][0]["r_frame_rate"] == "30/1"
+        assert "private tag" not in str(payload) and "private handler" not in str(payload)
+        encoded = canonical.read_bytes()
+        assert 0 <= encoded.find(b"moov") < encoded.find(b"mdat")
+        with Image.open(storage.resolve(ready.preview_path)) as poster:
+            assert poster.format == "WEBP" and poster.n_frames == 1
+            assert poster.width <= 320 and poster.height <= 180
+        assert storage.resolve(ready.path).is_file()
+        assert await cleanup_media_files(repository=repository, storage=storage) == 1
+        assert not storage.resolve(ready.path).exists()
+
+    attached = await http_client.post(
+        "/api/v1/boards/alice/threads",
+        json={"body": "videos", "posting_claim_token": token, "media_ids": media_ids},
+    )
+    assert attached.status_code == 201
+    thread_id = attached.json()["thread"]["id"]
+    assets = attached.json()["posts"][0]["media"]
+    assert len(assets) == 2
+    for item, media_id in zip(assets, media_ids, strict=True):
+        assert item["display_url"] is None and item["duration_seconds"] == 1
+        content = await http_client.get(item["content_url"], headers={"Range": "bytes=0-15"})
+        assert content.status_code == 200 and content.content == b""
+        assert content.headers["content-type"] == "video/mp4"
+        assert content.headers["x-accel-redirect"] == f"/_imageboard_media/video/{media_id}.mp4"
+        assert content.headers["cache-control"] == "no-store"
+        preview = await http_client.head(item["preview_url"])
+        assert preview.status_code == 200 and preview.headers["content-type"] == "image/webp"
+        assert preview.headers["x-accel-redirect"] == (
+            f"/_imageboard_media/video-previews/{media_id}.webp"
+        )
+        assert preview.headers["cache-control"] == "no-store"
+        display = await http_client.get(item["content_url"].replace("/content", "/display"))
+        assert display.status_code == 404
+
+    path = f"/api/v1/profiles/alice/threads/{thread_id}"
+    hidden = await http_client.patch(path, headers=csrf, json={"is_hidden": True})
+    assert hidden.status_code == 200
+    for item in assets:
+        for url in [item["preview_url"], item["content_url"]]:
+            hidden_asset = await http_client.get(url)
+            assert hidden_asset.status_code == 404
+            assert hidden_asset.headers["cache-control"] == "no-store"
+    assert (await http_client.delete(path, headers=csrf)).status_code == 204
+    assert await cleanup_media_files(repository=repository, storage=storage) == 4
+    assert not [f for f in storage.root.rglob("*") if f.is_file()]
+
+
+@pytest.mark.anyio
+async def test_video_upload_rejects_bad_inputs_and_enforces_byte_limit(
+    http_client: AsyncClient, tmp_path: Path,
+) -> None:
+    """MP4 проверяется по фактическому container, виду потока и параметрам"""
+
+    await register(http_client, "alice")
+    await login(http_client, "alice", "profile-password")
+    claim = await http_client.post("/api/v1/boards/alice/posting-claims")
+    assert claim.status_code == 201 and claim.json()["max_attachments"] == 10
+    token = claim.json()["token"]
+    source = tmp_path / "source.mp4"
+    valid = make_video_file(source)
+    for payload, status, code in [
+        (valid[:-10], 422, "invalid_media"),
+        (b"\x1aE\xdf\xa3\x93B\x82\x88webm", 415, "unsupported_media_type"),
+        (make_video_file(source, codec="mpeg4"), 415, "unsupported_media_type"),
+        (make_video_file(source, fps=31), 422, "invalid_media"),
+        (make_video_file(source, size="1922x32"), 422, "invalid_media"),
+        (make_video_file(source, duration=121, fps=1), 422, "invalid_media"),
+    ]:
+        rejected = await upload_video(http_client, "alice", token, payload)
+        assert rejected.status_code == status, rejected.text
+        assert rejected.json()["detail"]["code"] == code
+        assert not list(app.state.media_storage_root.rglob("*.upload"))
+
+    padding = 20 * MEBIBYTE - len(valid)
+    exact = valid + padding.to_bytes(4, "big") + b"free" + bytes(padding - 8)
+    assert (await upload_video(http_client, "alice", token, exact)).status_code == 201
+    rejected = await upload_video(http_client, "alice", token, exact + b"\0")
+    assert rejected.status_code == 413
+    assert rejected.json()["detail"]["code"] == "media_file_too_large"
+    assert len(list(app.state.media_storage_root.rglob("*.upload"))) == 1
+
+
+@pytest.mark.anyio
+async def test_video_upload_uses_board_attachment_count_and_total_limits(
+    http_client: AsyncClient, tmp_path: Path,
+) -> None:
+    """байты видео и изображений считаются вместе в пределах одной доски"""
+
+    csrf = await login(http_client, "owner", "owner-password")
+    board = await http_client.post(
+        "/api/v1/admin/boards",
+        headers=csrf,
+        json={
+            "slug": "limited",
+            "title": "Limited",
+            "media_overrides": {
+                "max_attachments_per_post": 2,
+                "max_attachment_size_mib": 2,
+                "max_total_size_mib": 2,
+            },
+        },
+    )
+    assert board.status_code == 200
+    claim = await http_client.post("/api/v1/boards/limited/posting-claims")
+    assert claim.status_code == 201 and claim.json()["max_attachments"] == 2
+    token = claim.json()["token"]
+    source = make_video_file(tmp_path / "source.mp4")
+    padding = MEBIBYTE + 8
+    video = source + padding.to_bytes(4, "big") + b"free" + bytes(padding - 8)
+    assert (await upload_video(http_client, "limited", token, video)).status_code == 201
+    rejected = await upload_video(http_client, "limited", token, video)
+    assert rejected.status_code == 413
+    assert rejected.json()["detail"]["code"] == "media_post_too_large"
+    image = await http_client.post(
+        "/api/v1/boards/limited/media",
+        data={"posting_claim_token": token},
+        files={"file": ("image.png", image_bytes("PNG"), "image/png")},
+    )
+    assert image.status_code == 201
+    rejected = await upload_video(http_client, "limited", token, source)
+    assert rejected.status_code == 422
+    assert rejected.json()["detail"]["code"] == "media_count_exceeded"
+    assert len(list(app.state.media_storage_root.rglob("*.upload"))) == 2
+
+
+@pytest.mark.anyio
+async def test_video_worker_retries_corrupt_samples_without_leaving_derivatives(
+    http_client: AsyncClient, tmp_path: Path,
+) -> None:
+    """повреждение кадров после upload оставляет только источник для повторной попытки"""
+
+    await register(http_client, "alice")
+    await login(http_client, "alice", "profile-password")
+    claim = await http_client.post("/api/v1/boards/alice/posting-claims")
+    assert claim.status_code == 201
+    payload = make_video_file(tmp_path / "source.mp4")
+    uploaded = await upload_video(http_client, "alice", claim.json()["token"], payload)
+    assert uploaded.status_code == 201
+    media_id = uploaded.json()["id"]
+    repository = MediaRepository(app.state.postgres_pool)
+    storage = MediaStorage(app.state.media_storage_root)
+    claimed = await repository.claim_by_id(
+        media_id, max_attempts=MAX_PROCESSING_ATTEMPTS, lease_duration=PROCESSING_LEASE,
+    )
+    assert claimed is not None
+    original = storage.resolve(claimed.path)
+    start = payload.index(b"mdat") + 4
+    end = payload.index(b"moov") - 4
+    original.write_bytes(payload[:start] + b"\xff" * (end - start) + payload[end:])
+    with pytest.raises(MediaPolicyError):
+        await process_job(repository, media_id, storage)
+    retry = await repository.fail_processing(
+        media_id, max_attempts=MAX_PROCESSING_ATTEMPTS, error="damaged video",
+        lease=claimed.processing_lease_until,
+    )
+    assert retry is not None and retry.processing_state.value == "queued"
+    assert [p for p in storage.root.rglob("*") if p.is_file()] == [original]
+
+    original.write_bytes(payload)
+    claimed = await repository.claim_by_id(
+        media_id, max_attempts=MAX_PROCESSING_ATTEMPTS, lease_duration=PROCESSING_LEASE,
+    )
+    assert claimed is not None
+    await process_job(repository, media_id, storage)
+    ready = await repository.get_by_id(media_id)
+    assert ready is not None and ready.processing_state.value == "ready"
+
+
+@pytest.mark.anyio
+async def test_video_preview_replace_failure_rolls_back_ready_and_cleanup(
+    http_client: AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ошибка публикации превью оставляет источник для следующей попытки"""
+
+    await register(http_client, "alice")
+    await login(http_client, "alice", "profile-password")
+    claim = await http_client.post("/api/v1/boards/alice/posting-claims")
+    assert claim.status_code == 201
+    payload = make_video_file(tmp_path / "source.mp4")
+    uploaded = await upload_video(http_client, "alice", claim.json()["token"], payload)
+    assert uploaded.status_code == 201
+    media_id = uploaded.json()["id"]
+    repository = MediaRepository(app.state.postgres_pool)
+    storage = MediaStorage(app.state.media_storage_root)
+    claimed = await repository.claim_by_id(
+        media_id, max_attempts=MAX_PROCESSING_ATTEMPTS, lease_duration=PROCESSING_LEASE,
+    )
+    assert claimed is not None
+    original = storage.resolve(claimed.path)
+    replace = storage.replace_from_temporary
+
+    def fail_preview(temporary_path: Path, relative_path: str) -> Path:
+        if relative_path == f"previews/{media_id}.webp":
+            assert storage.resolve(f"video/{media_id}.mp4").is_file()
+            raise OSError("preview replace failed")
+        return replace(temporary_path, relative_path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(storage, "replace_from_temporary", fail_preview)
+        with pytest.raises(OSError, match="preview replace failed"):
+            await process_job(repository, media_id, storage)
+
+    processing = await repository.get_by_id(media_id)
+    assert processing is not None and processing.processing_state.value == "processing"
+    assert processing.canonical_path is None and processing.preview_path is None
+    assert await cleanup_media_files(repository=repository, storage=storage) == 0
+    assert [path for path in storage.root.rglob("*") if path.is_file()] == [original]
+    retry = await repository.fail_processing(
+        media_id, max_attempts=MAX_PROCESSING_ATTEMPTS, error="preview replace failed",
+        lease=claimed.processing_lease_until,
+    )
+    assert retry is not None and retry.processing_state.value == "queued"
+    claimed = await repository.claim_by_id(
+        media_id, max_attempts=MAX_PROCESSING_ATTEMPTS, lease_duration=PROCESSING_LEASE,
+    )
+    assert claimed is not None
+    await process_job(repository, media_id, storage, expected_lease=claimed.processing_lease_until)
+    ready = await repository.get_by_id(media_id)
+    assert ready is not None and ready.processing_state.value == "ready"
+    assert await cleanup_media_files(repository=repository, storage=storage) == 1
+    assert not original.exists()
+
+
+@pytest.mark.anyio
+async def test_video_note_worker_requires_current_lease_and_public_claim_cannot_attach(
+    http_client: AsyncClient, tmp_path: Path,
+) -> None:
+    """доверенный kind поддерживается worker, но публичный claim отклоняет готовый кружок"""
+
+    await register(http_client, "alice")
+    await login(http_client, "alice", "profile-password")
+    claim = await http_client.post("/api/v1/boards/alice/posting-claims")
+    assert claim.status_code == 201
+    token = claim.json()["token"]
+    pool = app.state.postgres_pool
+    stored_claim = await PostingClaimsRepository(pool).get_claim(hash_token(token))
+    assert stored_claim is not None
+    repository = MediaRepository(pool)
+    storage = MediaStorage(app.state.media_storage_root)
+    data = make_video_file(tmp_path / "square.mp4", size="160x160")
+    relative_path = storage.new_quarantine_path(".mp4")
+    original = storage.prepare_parent(relative_path)
+    original.write_bytes(data)
+    note = await repository.create(
+        path=relative_path, size=len(data), mime_type="video/mp4", media_kind="video_note",
+        board_id=stored_claim.board_id, posting_claim_id=stored_claim.id, duration_seconds=1,
+    )
+    stale = await repository.claim_by_id(
+        note.id, max_attempts=MAX_PROCESSING_ATTEMPTS, lease_duration=timedelta(seconds=-1),
+    )
+    assert stale is not None
+    with pytest.raises(RuntimeError, match="lease was lost"):
+        await process_job(repository, note.id, storage)
+    assert [p for p in storage.root.rglob("*") if p.is_file()] == [original]
+    assert await repository.recover_expired(max_attempts=MAX_PROCESSING_ATTEMPTS)
+
+    current = await repository.claim_by_id(
+        note.id, max_attempts=MAX_PROCESSING_ATTEMPTS, lease_duration=PROCESSING_LEASE,
+    )
+    assert current is not None
+    assert await repository.fail_processing(
+        note.id, max_attempts=MAX_PROCESSING_ATTEMPTS, error="stale",
+        lease=stale.processing_lease_until,
+    ) is None
+    await process_job(repository, note.id, storage)
+    ready = await repository.get_by_id(note.id)
+    assert ready is not None and ready.processing_state.value == "ready"
+    assert ready.canonical_path and ready.preview_path
+    VideoProcessor().inspect(storage.resolve(ready.canonical_path), MediaType.VIDEO_NOTE)
+    rejected = await http_client.post(
+        "/api/v1/boards/alice/threads",
+        json={"body": "note", "posting_claim_token": token, "media_ids": [note.id]},
+    )
+    assert rejected.status_code == 403
+    assert rejected.json()["detail"]["code"] == "posting_claim_media_invalid"
+    assert await pool.fetchval("SELECT public_key FROM media WHERE id = $1", note.id) is None
+
+    thread = await http_client.post("/api/v1/boards/alice/threads", json={"body": "trusted note"})
+    assert thread.status_code == 201
+    thread_id = thread.json()["thread"]["id"]
+    post_id = thread.json()["posts"][0]["id"]
+    public_key = uuid.uuid4().hex
+    async with pool.acquire() as connection:
+        async with connection.transaction():
+            await PostingClaimsRepository(pool).attach_and_consume(
+                connection, stored_claim.id, post_id, [note.id], {note.id: public_key},
+            )
+    page = await http_client.get(f"/api/v1/threads/{thread_id}")
+    media = page.json()["op"]["media"][0]
+    assert media["media_kind"] == "video_note"
+    assert media["preview_url"] == f"/media/{public_key}/preview"
+    assert media["content_url"] == f"/media/{public_key}/content"
+    assert (await http_client.get(media["preview_url"])).status_code == 200
+    assert (await http_client.get(media["content_url"])).status_code == 200
+
+    await repository.delete(note.id)
+    assert await cleanup_media_files(repository=repository, storage=storage) == 3
+    assert not [f for f in storage.root.rglob("*") if f.is_file()]

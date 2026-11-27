@@ -1,16 +1,20 @@
 """безопасная проверка и перекодирование audio через фиксированные FFmpeg команды"""
 
-import json
 import math
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from app.services.media_policy import MediaPolicy, MediaPolicyCode, MediaPolicyError, MediaType
+from app.services.ffmpeg import (
+    PROBE_TIMEOUT_SECONDS,
+    TRANSCODE_TIMEOUT_SECONDS,
+    decode_probe,
+    positive_int,
+    positive_number,
+    run_ffmpeg,
+)
+from app.services.media_policy import MediaPolicy, MediaType
 from app.services.media_storage import MediaStorage
 
-PROBE_TIMEOUT_SECONDS = 10
-TRANSCODE_TIMEOUT_SECONDS = 120
 MAX_AUDIO_DURATION_SECONDS = 30 * 60
 MAX_VOICE_DURATION_SECONDS = 10 * 60
 MAX_SAMPLE_RATE = 48_000
@@ -33,6 +37,7 @@ class FFmpegMediaProcessor:
     def __init__(self, ffmpeg_bin: str = "ffmpeg", ffprobe_bin: str = "ffprobe") -> None:
         self._ffmpeg_bin = ffmpeg_bin
         self._ffprobe_bin = ffprobe_bin
+        self._run = run_ffmpeg
 
     def looks_like_audio_candidate(self, path: Path) -> bool:
         """решить, нужен ли ffprobe для container без доверия расширению"""
@@ -69,9 +74,9 @@ class FFmpegMediaProcessor:
         stream = audio_streams[0]
         codec = stream.get("codec_name")
         format_names = set(str(container.get("format_name", "")).split(","))
-        duration_seconds = self._duration(container.get("duration"))
-        channels = self._positive_int(stream.get("channels"))
-        sample_rate = self._positive_int(stream.get("sample_rate"))
+        duration_seconds = math.ceil(positive_number(container.get("duration"), "duration"))
+        channels = positive_int(stream.get("channels"), "channels")
+        sample_rate = positive_int(stream.get("sample_rate"), "sample_rate")
         if sample_rate > MAX_SAMPLE_RATE:
             raise MediaPolicy.invalid_media("частота audio превышает server-side лимит")
         if format_names == {"ogg"} and codec == "opus":
@@ -136,55 +141,4 @@ class FFmpegMediaProcessor:
             ],
             PROBE_TIMEOUT_SECONDS,
         )
-        try:
-            decoded = json.loads(completed.stdout)
-        except (TypeError, json.JSONDecodeError) as error:
-            raise MediaPolicy.invalid_media("FFprobe вернул некорректные метаданные") from error
-        if not isinstance(decoded, dict):
-            raise MediaPolicy.invalid_media()
-        return decoded
-
-    @staticmethod
-    def _duration(value: object) -> int:
-        try:
-            duration = float(str(value))
-        except (TypeError, ValueError) as error:
-            raise MediaPolicy.invalid_media("длительность audio не определена") from error
-        if not math.isfinite(duration) or duration <= 0:
-            raise MediaPolicy.invalid_media("длительность audio не определена")
-        return math.ceil(duration)
-
-    @staticmethod
-    def _positive_int(value: object) -> int:
-        try:
-            number = int(str(value))
-        except (TypeError, ValueError) as error:
-            raise MediaPolicy.invalid_media("технические параметры audio не определены") from error
-        if number <= 0:
-            raise MediaPolicy.invalid_media("технические параметры audio не определены")
-        return number
-
-    @staticmethod
-    def _run(arguments: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
-        """выполнить заранее собранный список аргументов без shell и с timeout"""
-
-        try:
-            completed = subprocess.run(
-                arguments,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
-        except FileNotFoundError as error:
-            raise MediaPolicyError(
-                code=MediaPolicyCode.MEDIA_PROCESSING_UNAVAILABLE,
-                message="FFmpeg/FFprobe не установлен на сервере",
-                http_status=503,
-            ) from error
-        except subprocess.TimeoutExpired as error:
-            raise MediaPolicy.invalid_media("превышено время безопасной обработки audio") from error
-        if completed.returncode != 0:
-            raise MediaPolicy.invalid_media("FFmpeg/FFprobe не смог обработать audio")
-        return completed
+        return decode_probe(completed.stdout)

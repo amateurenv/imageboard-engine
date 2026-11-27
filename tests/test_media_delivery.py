@@ -89,6 +89,9 @@ def test_nginx_template_keeps_derivatives_internal() -> None:
     assert 'X-Content-Type-Options "nosniff"' in config
     assert "_imageboard_media/audio" in config
     assert "_imageboard_media/voice" in config
+    assert "_imageboard_media/video" in config
+    assert "default_type video/mp4;" in config
+    assert "max_ranges 1;" in config
     assert "Accept-Ranges \"bytes\"" in config
     assert "quarantine" in config
     assert "location /media/" not in config

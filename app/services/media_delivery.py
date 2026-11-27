@@ -6,6 +6,7 @@ from typing import Protocol
 
 from app.repositories.media_delivery import DeliverableMedia, MediaDeliveryRepository
 from app.repositories.users import UserRecord
+from app.services.video_processing import VIDEO_KINDS, VIDEO_MIME
 
 INTERNAL_ACCEL_PREFIX = "/_imageboard_media"
 PUBLIC_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
@@ -34,6 +35,7 @@ class MediaDelivery:
 
     content_type: str
     accel_path: str
+    cache_control: str = "public, max-age=31536000, immutable"
 
 
 class MediaDeliveryService:
@@ -61,6 +63,27 @@ class MediaDeliveryService:
             return None
         media = await self._repository.get_deliverable(public_key)
         if media is None or not self._access.allows(media, actor):
+            return None
+        if media.media_kind in VIDEO_KINDS:
+            video_path = f"video/{media.id}.mp4"
+            preview_name = f"{media.id}.webp"
+            if (
+                media.canonical_path != video_path
+                or media.canonical_mime_type != VIDEO_MIME
+                or media.preview_path != f"previews/{preview_name}"
+            ):
+                return None
+            # у видео и его preview одинаковые правила кеша после модерации
+            if asset_kind == "content":
+                return MediaDelivery(
+                    VIDEO_MIME, f"{INTERNAL_ACCEL_PREFIX}/{video_path}", cache_control="no-store",
+                )
+            if asset_kind == "preview":
+                return MediaDelivery(
+                    "image/webp",
+                    f"{INTERNAL_ACCEL_PREFIX}/video-previews/{preview_name}",
+                    cache_control="no-store",
+                )
             return None
         if asset_kind == "content":
             if media.media_kind not in {"audio", "voice"} or media.canonical_path is None:

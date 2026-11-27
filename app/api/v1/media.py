@@ -1,4 +1,4 @@
-"""multipart upload первого image-only этапа"""
+"""multipart upload для доски с действующим posting claim"""
 
 from typing import Annotated
 
@@ -31,7 +31,7 @@ async def upload_image(
     current_user: OptionalCurrentUserDependency,
     posting_claim_token: Annotated[str | None, Form()] = None,
 ) -> MediaUploadResponse:
-    """принять только JPEG PNG WebP в закрытый quarantine"""
+    """принять поддерживаемое вложение в закрытый quarantine"""
 
     await check_ip_bans(request, ip_bans_repository)
     try:

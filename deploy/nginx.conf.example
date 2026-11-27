@@ -46,6 +46,31 @@ server {
         limit_except GET HEAD { deny all; }
     }
 
+    location ~ ^/_imageboard_media/video/([1-9][0-9]*)\.mp4$ {
+        internal;
+        alias /srv/imageboard-media/video/$1.mp4;
+        autoindex off;
+        default_type video/mp4;
+        # range обрабатывает static handler после проверки видимости в приложении
+        max_ranges 1;
+        add_header Content-Disposition "inline" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Cache-Control "no-store" always;
+        limit_except GET HEAD { deny all; }
+    }
+
+    # отдельный маршрут оставляет то же правило кеша для видео и его превью
+    location ~ ^/_imageboard_media/video-previews/([1-9][0-9]*)\.webp$ {
+        internal;
+        alias /srv/imageboard-media/previews/$1.webp;
+        autoindex off;
+        default_type image/webp;
+        add_header Content-Disposition "inline" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Cache-Control "no-store" always;
+        limit_except GET HEAD { deny all; }
+    }
+
     # любой другой внутренний путь, включая quarantine и originals, остаётся недоступным
     location /_imageboard_media/ {
         internal;

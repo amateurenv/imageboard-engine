@@ -1,11 +1,12 @@
-"""первый безопасный multipart upload только для изображений"""
+"""multipart upload проверенных вложений в закрытый quarantine"""
 
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
-from asyncpg import Connection, Pool
+from asyncpg import Pool
 from fastapi import UploadFile
 from redis.asyncio import Redis
 
@@ -30,9 +31,11 @@ from app.services.posting_policy import (
     PostingPermissionError,
     check_posting_permission,
 )
+from app.services.video_processing import VIDEO_MIME, VideoProcessor, looks_like_mp4_video
 
 # потоковая запись ограничивает память одного запроса даже для заявленного большого файла
 UPLOAD_CHUNK_SIZE = 1024 * 1024
+MULTIPART_OVERHEAD_BYTES = 64 * 1024
 logger = logging.getLogger(__name__)
 
 
@@ -49,7 +52,7 @@ class UploadInspection:
 
 
 class MediaUploadService:
-    """сохранить image в quarantine и создать только queued запись media"""
+    """сохранить файл в quarantine и создать только queued запись media"""
 
     def __init__(
         self,
@@ -58,12 +61,14 @@ class MediaUploadService:
         settings: SiteSettings,
         storage_root: Path,
         audio_processor: FFmpegMediaProcessor | None = None,
+        video_processor: VideoProcessor | None = None,
     ) -> None:
         self._pool = pool
         self._redis = redis_client
         self._settings = settings
         self._storage = MediaStorage(storage_root)
         self._audio_processor = audio_processor or FFmpegMediaProcessor()
+        self._video_processor = video_processor or VideoProcessor()
         self._claims = PostingClaimsRepository(pool)
         self._media = MediaRepository(pool)
 
@@ -76,7 +81,7 @@ class MediaUploadService:
         actor: UserRecord | None,
         content_length: str | None,
     ) -> MediaRecord:
-        """принять изображение без доверия имени, MIME или размеру клиента"""
+        """принять вложение без доверия имени, MIME или размеру клиента"""
 
         path: str | None = None
         try:
@@ -87,9 +92,11 @@ class MediaUploadService:
             policy = self._policy(board)
             self._ensure_upload_enabled(policy, actor)
             self._check_declared_size(content_length, policy)
+            token_hash = hash_token(token)
+            self._check_claim(await self._claims.get_claim(token_hash), board, actor)
 
             # имя не связано с filename клиента и никогда не возвращается api
-            path = self._storage.new_quarantine_path(".image")
+            path = self._storage.new_quarantine_path(".upload")
             size = await self._stream_to_quarantine(file, path, policy)
             inspected = await asyncio.to_thread(self._inspect, self._storage.resolve(path))
 
@@ -101,8 +108,8 @@ class MediaUploadService:
                     self._check_any_posting_policy(locked_board, actor)
                     current_policy = self._policy(locked_board)
                     self._ensure_upload_enabled(current_policy, actor)
-                    claim = await self._lock_valid_claim(
-                        connection, token, locked_board, actor
+                    claim = self._check_claim(
+                        await self._claims.lock_claim(connection, token_hash), locked_board, actor
                     )
                     existing_sizes = await self._claims.lock_unattached_media_sizes(
                         connection, claim.id
@@ -153,8 +160,16 @@ class MediaUploadService:
             await file.close()
 
     def _inspect(self, path: Path) -> UploadInspection:
-        """сначала доверять image decoder, затем ffprobe только для узнаваемого audio container"""
+        """выбрать decoder по содержимому и назначить публичному MP4 обычный тип video"""
 
+        if looks_like_mp4_video(path):
+            video = self._video_processor.inspect(path, MediaType.VIDEO)
+            return UploadInspection(
+                VIDEO_MIME, MediaType.VIDEO,
+                duration_seconds=video.duration_seconds,
+                channels=video.channels,
+                sample_rate=video.sample_rate,
+            )
         try:
             image = validate_image(path)
         except MediaPolicyError as image_error:
@@ -190,7 +205,7 @@ class MediaUploadService:
                     if size > policy.max_attachment_size_bytes:
                         raise MediaPolicyError(
                             code=MediaPolicyCode.MEDIA_FILE_TOO_LARGE,
-                            message="размер изображения больше лимита доски",
+                            message="размер вложения больше лимита доски",
                             http_status=413,
                             limit_bytes=policy.max_attachment_size_bytes,
                         )
@@ -210,7 +225,7 @@ class MediaUploadService:
             declared_size = int(content_length)
         except ValueError:
             return
-        if declared_size > policy.max_attachment_size_bytes:
+        if declared_size > policy.max_attachment_size_bytes + MULTIPART_OVERHEAD_BYTES:
             raise MediaPolicyError(
                 code=MediaPolicyCode.MEDIA_FILE_TOO_LARGE,
                 message="заявленный размер upload больше лимита доски",
@@ -218,17 +233,13 @@ class MediaUploadService:
                 limit_bytes=policy.max_attachment_size_bytes,
             )
 
-    async def _lock_valid_claim(
-        self,
-        connection: Connection,
-        token: str,
+    @staticmethod
+    def _check_claim(
+        claim: PostingClaim | None,
         board: ClaimBoard,
         actor: UserRecord | None,
     ) -> PostingClaim:
-        """проверить одноразовый claim под блокировкой перед созданием media"""
-
-        claim = await self._claims.lock_claim(connection, hash_token(token))
-        from datetime import UTC, datetime
+        """проверить claim до чтения файла и повторно под блокировкой перед записью"""
 
         if claim is None or claim.consumed_at is not None or claim.expires_at <= datetime.now(UTC):
             raise PostingClaimError("posting_claim_invalid", 403)

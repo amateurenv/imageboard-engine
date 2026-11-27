@@ -1,5 +1,7 @@
 """sql запросы для файлов медиа"""
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -98,6 +100,29 @@ RETURNING id, path, size, mime_type, created_at, processing_state,
           media_kind, duration_seconds, channels, sample_rate, canonical_path, canonical_mime_type
 """
 
+MARK_VIDEO_READY_SQL = """
+WITH ready AS (
+    UPDATE media
+    SET processing_state = 'ready',
+        processing_lease_until = NULL,
+        last_processing_error = NULL,
+        canonical_path = $3,
+        canonical_mime_type = 'video/mp4',
+        preview_path = $4,
+        duration_seconds = $5,
+        channels = $6,
+        sample_rate = $7
+    WHERE id = $1 AND processing_state = 'processing'
+      AND processing_lease_until = $2 AND processing_lease_until > clock_timestamp()
+      AND media_kind IN ('video', 'video_note')
+    RETURNING path
+)
+INSERT INTO media_cleanup_tasks (relative_path)
+SELECT path FROM ready
+ON CONFLICT (relative_path) DO UPDATE SET completed_at = NULL
+RETURNING relative_path
+"""
+
 FAIL_PROCESSING_SQL = """
 UPDATE media
 SET processing_state = CASE
@@ -107,6 +132,7 @@ SET processing_state = CASE
     processing_lease_until = NULL,
     last_processing_error = $3
 WHERE id = $1 AND processing_state = 'processing'
+  AND ($4::timestamptz IS NULL OR processing_lease_until = $4)
 RETURNING id, path, size, mime_type, created_at, processing_state,
           processing_attempts, processing_lease_until, last_processing_error,
           board_id, posting_claim_id, display_path, preview_path, is_animation,
@@ -383,18 +409,39 @@ class MediaRepository:
         )
         return None if row is None else _to_media_record(row)
 
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[Connection]:
+        """держать блокировку записи до завершения публикации производных файлов"""
+
+        async with self._postgres_pool.acquire() as connection:
+            async with connection.transaction():
+                yield connection
+
+    async def mark_video_ready(
+        self, connection: Connection, media_id: int, *, lease: datetime,
+        canonical_path: str, preview_path: str, duration_seconds: int,
+        channels: int | None, sample_rate: int | None,
+    ) -> bool:
+        """подтвердить текущий lease и запланировать очистку оригинала в одном commit"""
+
+        return await connection.fetchval(
+            MARK_VIDEO_READY_SQL, media_id, lease, canonical_path, preview_path,
+            duration_seconds, channels, sample_rate,
+        ) is not None
+
     async def fail_processing(
         self,
         media_id: int,
         *,
         max_attempts: int,
         error: str,
+        lease: datetime | None = None,
     ) -> MediaRecord | None:
         """записать ошибку и выбрать retry или окончательный failed"""
 
         error_text = error[:1_000]
         row = await self._postgres_pool.fetchrow(
-            FAIL_PROCESSING_SQL, media_id, max_attempts, error_text
+            FAIL_PROCESSING_SQL, media_id, max_attempts, error_text, lease,
         )
         if row is None:
             return None

@@ -28,6 +28,7 @@ from app.services.spam import SpamService
 from app.services.staff import StaffService
 from app.services.threads import ThreadsService
 from app.services.users import UsersService
+from app.services.video_processing import VideoProcessor
 from app.ws.manager import WebSocketManager
 
 
@@ -358,12 +359,14 @@ def get_media_upload_service(
 ) -> MediaUploadService:
     """создать upload service с закрытым storage из настроек процесса"""
 
+    settings = get_settings()
     return MediaUploadService(
         postgres_pool,
         redis_client,
         site_settings,
         request.app.state.media_storage_root,
-        FFmpegMediaProcessor(get_settings().ffmpeg_bin, get_settings().ffprobe_bin),
+        FFmpegMediaProcessor(settings.ffmpeg_bin, settings.ffprobe_bin),
+        VideoProcessor(settings.ffmpeg_bin, settings.ffprobe_bin),
     )
 
 

@@ -15,7 +15,7 @@
 6. Запускай `python -m scripts.cleanup_sessions` по таймеру
 7. Запускай `python -m scripts.cleanup_posting_claims` и
    `python -m scripts.cleanup_media_files` по таймеру
-8. Если нужен image upload, запусти отдельный process `python -m scripts.media_worker`
+8. Для обработки вложений запусти отдельный процесс `python -m scripts.media_worker`
    с тем же закрытым `MEDIA_STORAGE_ROOT`, но не публикуй этот каталог через web server
 
 ## наблюдаемость
@@ -24,15 +24,16 @@
 публичного запуска добавь централизованный сбор ошибок, метрики запросов,
 занятости PostgreSQL/Redis и оповещения о недоступности `/ready`.
 
-## media - ограниченный image upload
+## загрузка и выдача media
 
 `/api/v1/media` остаётся выключенным, но `POST /api/v1/boards/{slug}/media`
-принимает JPEG, PNG, static WebP, GIF, animated WebP, MP3, M4A/AAC и OGG/Opus voice только с действующим posting claim. Файл попадает в
-закрытый quarantine, проверяется по содержимому и после worker получает display
-и preview WebP без metadata.
+принимает JPEG, PNG, static WebP, GIF, animated WebP, MP3, M4A/AAC, OGG/Opus
+и MP4 с H.264 и необязательной дорожкой AAC. Загрузка требует действующего
+posting claim. Файл попадает в закрытый quarantine, а worker перекодирует его
+в производные файлы без исходных метаданных.
 
-Готовое attached media получает opaque key. `GET /media/{key}/preview` и
-`GET /media/{key}/display` повторно проверяют `ready`, attach и видимость в
+Готовое attached media получает opaque key. Запросы `GET` и `HEAD` к
+`/media/{key}/preview|display|content` повторно проверяют `ready`, attach и видимость в
 PostgreSQL, после чего передают Nginx только `X-Accel-Redirect` на internal
 location. FastAPI не читает файл, quarantine и оригиналы не имеют HTTP URL.
 `deploy/nginx.conf.example` - шаблон, а не применённая конфигурация: оператор
@@ -43,7 +44,8 @@ GIF и animated WebP проходят отдельные пределы worker: 
 кадра, 8 миллионов пикселей на кадр, 300 кадров, 30 секунд и 100 миллионов
 суммарно декодированных пикселей. Display перекодируется в animated WebP, preview
 остаётся статичным WebP. Это серверная защита ресурсов, а не пределы Telegram.
-Обычный байтовый предел - 20 MiB на файл, до 10 вложений и 200 MiB на пост.
+По умолчанию действует предел 20 MiB на файл, 10 вложений и 200 MiB на пост.
+Настройки сайта и переопределения досок управляются через `/admin`.
 
 Audio MP3/M4A/AAC и voice OGG/Opus требуют system dependencies `ffprobe` и
 `ffmpeg`, заданные через `FFPROBE_BIN` и `FFMPEG_BIN`; это обязательные
@@ -53,15 +55,50 @@ M4A/AAC для audio и OGG/Opus для voice. Лимиты Imageboard: audio д
 voice до 10 минут, audio до двух каналов, voice строго один канал, sample rate до
 48 kHz. Это не утверждения о лимитах Telegram. Production Nginx должен оставить
 audio/voice locations `internal` и разрешать Range только для derivative файлов.
-Известные запрещённые containers возвращают `415 unsupported_media_type`, а
-повреждённые допустимые кандидаты и случайные байты - `422 invalid_media`.
+
+Для видео установи FFmpeg с энкодерами `libx264`, `aac` и `libwebp`. Движок
+проверяет структуру MP4 и дорожки через FFprobe. Он принимает одну дорожку
+H.264 и, при наличии звука, одну AAC до двух каналов и 48 kHz. Входное видео
+ограничено 120 секундами, 1920×1080 или 1080×1920, 30 кадрами/с и
+3 600 видеопакетами. Worker ограничивает время, потоки, размер кадра,
+максимальную единичную аллокацию FFmpeg и размер канонического MP4 до 20 MiB.
+На время выполнения FFmpeg отключены внешние ссылки MP4 и сетевые протоколы.
+Готовые файлы содержат H.264/yuv420p 30 кадров/с, AAC-LC с частотой 48 кГц при наличии звука и
+`faststart`. Статичный WebP до 320×180 создаётся из первого кадра канонического
+видео. Worker проверяет готовый MP4 и сохраняет параметры из него. Замена обоих
+файлов выполняется под блокировкой текущей задачи. Состояние `ready` и задача
+очистки исходника фиксируются в одной транзакции. Для нового окружения и для
+обновления примени миграцию `021_video_media` обычной командой мигратора.
+[Документация FFmpeg](https://ffmpeg.org/ffmpeg.html)
+
+Внутренний тип `video_note` использует тот же worker с пределами 60 секунд и
+640×640, квадратным кадром и бюджетом 1 800 видеопакетов. Будущий Telegram-бот
+будет задавать этот тип из проверенного Telegram update и публиковать через
+доверенный серверный код. Публичная форма и публичные posting claims дают
+клиенту работать с обычным видео.
+[Telegram Bot API](https://core.telegram.org/bots/api#sendvideonote)
+
+Для воспроизведения Nginx читает канонический файл из внутреннего
+`/_imageboard_media/video/` и обрабатывает один Range за запрос. Превью читается
+через отдельный internal location `/_imageboard_media/video-previews/` с alias
+на каталог `previews`. Для обоих маршрутов сохрани `Cache-Control: no-store`,
+чтобы после скрытия или удаления новый запрос снова проверял видимость в API.
+Выдай worker и Nginx права на соответствующие операции с производными файлами,
+а доступ к исходникам оставь приложению и worker. Проверь Nginx с теми же
+пользователями и правами, которые будут использоваться при запуске.
+[Документация Nginx](https://nginx.org/en/docs/http/ngx_http_core_module.html#max_ranges)
+
+Запрещённые контейнеры и неподдерживаемые дорожки MP4 возвращают
+`415 unsupported_media_type`. Повреждённый допустимый кандидат или превышение
+технического лимита возвращает `422 invalid_media`. Нарушение, обнаруженное
+при полном декодировании, проходит очередь retry/failed.
 
 До широкого public media запуска обязательно нужны:
 
 - антивирус или отдельный безопасный scanner - он ещё не реализован;
 - квоты диска, метрики, alerting и отдельная безопасная раздача через Nginx;
 - операционные проверки worker, восстановления после файловой ошибки и нагрузки;
-- отдельные решения для видео, video note, stickers, TGS/WebM, Telegram media и других форматов;
+- разбор зависших временных файлов после принудительной остановки worker;
 - публичный frontend и Telegram-бот.
 
 `NoopMediaScanner` - только extension point для development. Он не является
@@ -88,5 +125,6 @@ audio/voice locations `internal` и разрешать Range только для
 3. cookie сессии в production имеет `Secure`, а `APP_DEBUG=false`
 4. timer очистки сессий и резервные копии действительно запускаются по расписанию
 5. восстановление последней резервной копии проходит в отдельной тестовой базе
-6. `GET /media/{opaque key}/display` работает только через proxy, а прямой URL
-   `/_imageboard_media/...` снаружи даёт `404`
+6. Готовый MP4 по `GET /media/{opaque key}/content` отдаёт `206` и
+   `Content-Range` на запрос `Range: bytes=0-31`. Прямой внутренний URL и opaque
+   URL после скрытия поста или треда возвращают `404`

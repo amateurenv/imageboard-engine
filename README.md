@@ -41,8 +41,9 @@
 - posting claims для атомарной привязки готовых media к будущему треду или ответу
 - image upload через claim: JPEG, PNG, static WebP, GIF и animated WebP в закрытый quarantine
 - worker создаёт безопасный WebP display и статичный WebP preview через server-side re-encode
-- выдача только ready display/preview через FastAPI-проверку и internal Nginx
+- выдача только ready derivatives через FastAPI-проверку и internal Nginx
 - audio MP3/M4A/AAC и voice OGG/Opus через private quarantine и canonical transcoding
+- видео MP4/H.264 с AAC или без звука, статичный WebP preview и HTTP Range через Nginx
 - защита от потерянных частичных обновлений досок и тредов
 - ограничение bcrypt-пароля 72 UTF-8 байтами и контролируемый `409` для повторного IP-ban
 - команда очистки истёкших staff-сессий
@@ -54,7 +55,8 @@
 - полноценной админ-панели пока нет: минимальная страница `/admin` управляет
   входом, досками и настройками через существующее API
 - CDN и production Nginx пока не настроены - есть только tracked template
-- видео, video notes, stickers, TGS/WebM, Telegram media и антивирус ещё не реализованы
+- для публикации `video_note` нужен будущий Telegram-адаптер
+- stickers, TGS/WebM, Telegram media и антивирус ещё не реализованы
 - WebSocket-события, Telegram-бот и публичный frontend не готовы
 - нет production-конфигурации reverse proxy, HTTPS, резервного копирования и мониторинга
 
@@ -207,10 +209,9 @@ POST /api/v1/boards/{slug}/media
 ```
 
 Это `multipart/form-data` с полями `posting_claim_token` и `file`. Он принимает
-JPEG, PNG, static WebP, GIF, animated WebP, MP3, M4A/AAC и OGG/Opus voice. MIME-type, расширение и исходное имя файла не считаются
-доказательством типа. Файл записывается кусками под серверным случайным именем
-в закрытый quarantine, проверяется Pillow по содержимому и остаётся недоступным
-по URL.
+JPEG, PNG, static WebP, GIF, animated WebP, MP3, M4A/AAC, OGG/Opus voice и MP4
+с H.264 и необязательным AAC. Файл записывается кусками под случайным именем в
+закрытый quarantine. Pillow и FFprobe определяют формат по содержимому.
 
 Worker повторно проверяет изображение, ограничивает разрешение и число пикселей.
 Для GIF и animated WebP он создаёт animated WebP display с порядком кадров и
@@ -219,12 +220,13 @@ image display и preview также создаются через перекод
 Исходник из quarantine удаляется только после успешного создания производных
 файлов. Оригинал и quarantine никогда не раздаются.
 
-После атомарной привязки ready image к видимому посту движок создаёт случайный
+После атомарной привязки ready media к видимому посту движок создаёт случайный
 opaque public key. Готовые derivative выдаются только так:
 
 ```text
-GET /media/{public_key}/preview
-GET /media/{public_key}/display
+GET, HEAD /media/{public_key}/preview
+GET, HEAD /media/{public_key}/display
+GET, HEAD /media/{public_key}/content
 ```
 
 FastAPI снова проверяет key, `ready`, attach и видимость поста/треда, затем
@@ -235,8 +237,8 @@ FastAPI снова проверяет key, `ready`, attach и видимость
 абсолютный `MEDIA_STORAGE_ROOT`, сохранить private permissions и не публиковать
 storage через public `alias`.
 
-Audio и voice требуют установленных оператором `ffprobe` и `ffmpeg`; это
-обязательные зависимости production и CI. Сервер
+Audio, voice и video требуют установленных оператором `ffprobe` и `ffmpeg`.
+Это обязательные зависимости production и CI. Для audio и voice сервер
 проверяет container, codec, длительность, channels и sample rate, затем worker
 декодирует upload целиком и создаёт только M4A/AAC для `audio` или OGG/Opus для
 `voice`. Оригинал из quarantine не выдаётся и удаляется только после успешного
@@ -244,10 +246,21 @@ canonical transcoding. Готовый audio/voice использует `/media/{
 Nginx поддерживает Range playback через внутренний location.
 
 Для `audio` лимит - 30 минут, до двух каналов и 48 kHz; для `voice` - 10 минут,
-ровно один канал и 48 kHz. Известный, но запрещённый container (например MP4,
-WAV, FLAC, WebM или archive) возвращает `415 unsupported_media_type` без дорогого
-decoder. Повреждённый допустимый audio-кандидат и случайные байты возвращают
-`422 invalid_media`. `NoopMediaScanner` остаётся extension point, а не антивирусом.
+ровно один канал и 48 kHz. Известный запрещённый контейнер или неподдерживаемые
+дорожки MP4 возвращают `415 unsupported_media_type`. Повреждённые кандидаты,
+случайные байты и превышение технических лимитов возвращают `422 invalid_media`.
+Текущий `NoopMediaScanner` пропускает медиа без антивирусной проверки.
+
+Worker создаёт MP4 с H.264/yuv420p, необязательной дорожкой AAC-LC на 48 кГц и
+`faststart`, а также статичный WebP из первого кадра. Он проверяет готовый
+MP4 и сохраняет его фактические параметры. Запись становится `ready` после
+публикации обоих файлов. Клиент получает `content_url` и `preview_url`.
+Nginx обслуживает Range для MP4. Видео и его превью выдаются с
+`Cache-Control: no-store`, чтобы повторный запрос прошёл проверку видимости.
+Для `video_note` worker использует квадратный кадр до 640×640 и длительность
+до 60 секунд. Публичная форма принимает
+квадратный MP4 как обычное видео, а публикация кружков зарезервирована для
+будущего Telegram-бота. [Telegram Bot API](https://core.telegram.org/bots/api#sendvideonote)
 
 Статичный image ограничен 12 000 px по каждой стороне и 20 миллионами пикселей.
 Для animation действуют серверные anti-resource-abuse пределы: до 4 096 px по
@@ -270,33 +283,21 @@ media и помечает claim consumed. Один claim нельзя испол
 Документы, архивы и исполняемые файлы не входят в модель движка; поддерживаются
 только разрешённые типы медиа.
 
-Сейчас upload принимает JPEG, PNG, static WebP, GIF, animated WebP, MP3, M4A/AAC
-и OGG/Opus voice. В `media`
-готовая animation помечается `is_animation: true`, поэтому клиент знает, что
-display анимирован, а preview остаётся статичным. `audio` проходит только как
-MP3/M4A/AAC, а `voice` - только OGG/Opus. Video, video note, stickers, documents,
-archives и исполняемые файлы отклоняются. Telegram,
-custom emoji и bot API не подключены.
+В `media` готовая анимация помечается `is_animation: true`. Это относится к
+`display_url`, а `preview_url` всегда ведёт на статичный WebP.
 
-Будущие форматы перечислены как roadmap, а не как готовая проверка:
-
-| Тип | Сейчас | Будущее ограничение |
+| Тип | Публичная загрузка | Лимиты |
 |---|---:|---|
 | photo JPEG/PNG/static WebP | да | до 20 MiB |
 | animation GIF / animated WebP | да | до 20 MiB и server-side animation limits |
-| video MP4 | нет | до 20 MiB |
-| video note | нет | MPEG-4, до 20 MiB и 60 секунд |
+| video MP4 | да | до 20 MiB, 120 секунд, 1920×1080 или 1080×1920, 30 кадров/с |
+| video note | будущий Telegram-бот | до 20 MiB, 60 секунд, 640×640, 30 кадров/с |
 | music/audio MP3/M4A/AAC | да | до 20 MiB, до 30 минут, до 2 каналов, 48 kHz |
 | voice OGG/Opus | да | до 20 MiB, до 10 минут, 1 канал, 48 kHz |
-| static sticker | нет | PNG/WebP, до 512 KiB, одна сторона до 512 px |
-| animated TGS sticker | нет | до 64 KiB, 512×512, до 3 секунд |
-| WebM video sticker | нет | VP9 без аудио, до 256 KiB, до 3 секунд и 512×512 |
-| Telegram custom emoji | нет | text entity с fallback, не вложение |
-
-Общий будущий предел остаётся единым: до 10 вложений, до 20 MiB на обычное
-вложение (`20_971_520` bytes) и до 200 MiB на пост (`209_715_200` bytes).
-Он соответствует лимиту скачивания файлов обычным Telegram Bot API, но сам
-Telegram-адаптер пока не реализован.
+| static sticker | запланировано | PNG/WebP, до 512 KiB, одна сторона до 512 px |
+| animated TGS sticker | запланировано | до 64 KiB, 512×512, до 3 секунд |
+| WebM video sticker | запланировано | VP9 без аудио, до 256 KiB, до 3 секунд и 512×512 |
+| Telegram custom emoji | запланировано | текстовая сущность с fallback |
 
 HTTP API уже возвращает одинаковые машинные коды ошибок для сайта и будущего
 мобильного клиента. Telegram-бот позже сам преобразует эти коды в короткие

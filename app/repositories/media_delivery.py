@@ -12,8 +12,8 @@ class DeliverableMedia:
     id: int
     public_key: str
     mime_type: str
-    display_path: str
-    preview_path: str
+    display_path: str | None
+    preview_path: str | None
     media_kind: str
     canonical_path: str | None
     canonical_mime_type: str | None
@@ -35,6 +35,8 @@ WHERE media.public_key=$1
       (media.media_kind='image' AND media.display_path IS NOT NULL
        AND media.preview_path IS NOT NULL)
       OR (media.media_kind IN ('audio', 'voice') AND media.canonical_path IS NOT NULL)
+      OR (media.media_kind IN ('video', 'video_note') AND media.canonical_path IS NOT NULL
+          AND media.preview_path IS NOT NULL AND media.canonical_mime_type = 'video/mp4')
   )
   AND post.is_hidden=FALSE
   AND thread.is_hidden=FALSE

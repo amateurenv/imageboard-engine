@@ -1,20 +1,23 @@
-"""worker безопасно перекодирует image из quarantine в закрытые производные файлы"""
+"""worker перекодирует media из quarantine в закрытые производные файлы"""
 
 import asyncio
 import logging
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from PIL import Image, ImageOps
 
 from app.core.config import get_settings
 from app.core.database import close_postgres_pool, create_postgres_pool
 from app.core.redis import close_redis_client, create_redis_client
-from app.repositories.media import MediaRepository
+from app.repositories.media import MediaRecord, MediaRepository
 from app.services.audio_processing import FFmpegMediaProcessor
 from app.services.image_validation import validate_image
+from app.services.media_policy import MediaType
+from app.services.media_queue import MediaProcessingState
 from app.services.media_scanner import MediaScanner, NoopMediaScanner
 from app.services.media_storage import MediaStorage
+from app.services.video_processing import VIDEO_KINDS, VideoProcessor
 
 # redis будит worker раньше следующей проверки, но postgresql остаётся источником истины
 QUEUE_KEY = "media:previews"
@@ -115,21 +118,78 @@ def make_derivatives(
     return display_path, preview_path
 
 
+async def _process_video(
+    repository: MediaRepository, media: MediaRecord, storage: MediaStorage,
+    processor: VideoProcessor,
+) -> None:
+    """сделать оба производных файла и опубликовать их под блокировкой lease"""
+
+    lease = media.processing_lease_until
+    if lease is None:
+        raise RuntimeError("media processing lease was lost")
+    source = storage.resolve(media.path)
+    kind = MediaType(media.media_kind)
+    canonical_path = f"video/{media.id}.mp4"
+    preview_path = f"previews/{media.id}.webp"
+    video = storage.temporary_path(canonical_path)
+    preview = storage.temporary_path(preview_path)
+    conversion = asyncio.create_task(
+        asyncio.to_thread(processor.transcode, source, video, preview, kind)
+    )
+    try:
+        inspected = await asyncio.shield(conversion)
+        async with repository.transaction() as connection:
+            ready = await repository.mark_video_ready(
+                connection, media.id, lease=lease,
+                canonical_path=canonical_path, preview_path=preview_path,
+                duration_seconds=inspected.duration_seconds,
+                channels=inspected.channels, sample_rate=inspected.sample_rate,
+            )
+            if not ready:
+                raise RuntimeError("media processing lease was lost")
+            # commit открывает выдачу только после замены обоих файлов под блокировкой строки
+            try:
+                storage.replace_from_temporary(video, canonical_path)
+                storage.replace_from_temporary(preview, preview_path)
+            except Exception:
+                storage.delete_file(canonical_path)
+                storage.delete_file(preview_path)
+                raise
+    finally:
+        # отмена coroutine не останавливает ffmpeg в потоке - дожидаемся записи перед очисткой
+        if not conversion.done():
+            await asyncio.gather(conversion, return_exceptions=True)
+        video.unlink(missing_ok=True)
+        preview.unlink(missing_ok=True)
+
+
 async def process_job(
     repository: MediaRepository,
     media_id: int,
     storage: MediaStorage,
     scanner: MediaScanner | None = None,
     audio_processor: FFmpegMediaProcessor | None = None,
+    *,
+    expected_lease: datetime | None = None,
+    video_processor: VideoProcessor | None = None,
 ) -> None:
     """создать производные файлы и пометить запись ready только в самом конце"""
 
     media = await repository.get_by_id(media_id)
-    if media is None:
+    if media is None or media.processing_state is not MediaProcessingState.PROCESSING:
+        return
+    if expected_lease is not None and media.processing_lease_until != expected_lease:
         return
     source_path = storage.resolve(media.path)
     # production scanner подключат здесь - до derivative и перевода media в ready
     await asyncio.to_thread((scanner or NoopMediaScanner()).scan, source_path)
+    if media.media_kind in VIDEO_KINDS:
+        settings = get_settings()
+        await _process_video(
+            repository, media, storage,
+            video_processor or VideoProcessor(settings.ffmpeg_bin, settings.ffprobe_bin),
+        )
+        return
     if media.media_kind in {"audio", "voice"}:
         processor = audio_processor or FFmpegMediaProcessor(
             get_settings().ffmpeg_bin, get_settings().ffprobe_bin
@@ -205,12 +265,15 @@ async def run_worker() -> None:
                 await redis_client.brpop(QUEUE_KEY, timeout=IDLE_WAIT_SECONDS)
                 continue
             try:
-                await process_job(repository, media.id, storage)
+                await process_job(
+                    repository, media.id, storage, expected_lease=media.processing_lease_until,
+                )
             except Exception as error:
                 result = await repository.fail_processing(
                     media.id,
                     max_attempts=MAX_PROCESSING_ATTEMPTS,
                     error=str(error),
+                    lease=media.processing_lease_until,
                 )
                 if result is not None and result.processing_state.value == "queued":
                     # запись уже сохранена в postgresql, поэтому ошибка lpush не потеряет retry
