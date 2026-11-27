@@ -10,6 +10,8 @@ THREADS_WINDOW_SECONDS = 24 * 60 * 60
 POSTS_WINDOW_SECONDS = 60 * 60
 DELETION_PASSWORD_WINDOW_SECONDS = 60 * 60
 DELETION_PASSWORD_MAX_ATTEMPTS = 5
+MEDIA_UPLOAD_WINDOW_SECONDS = 60 * 60
+MEDIA_UPLOAD_MAX_ATTEMPTS = 20
 
 # lua выполняется в redis целиком, поэтому параллельные запросы не обходят лимит
 CHECK_AND_INCREMENT_SCRIPT = """
@@ -64,6 +66,16 @@ class SpamService:
             DELETION_PASSWORD_MAX_ATTEMPTS,
             DELETION_PASSWORD_WINDOW_SECONDS,
             "deletion password rate limit exceeded",
+        )
+
+    async def check_media_upload_limit(self, client_ip: str, board_slug: str) -> None:
+        """ограничить число тяжёлых multipart запросов до записи на диск"""
+
+        await self._check_limit(
+            f"spam:media_upload:{board_slug}:{client_ip}",
+            MEDIA_UPLOAD_MAX_ATTEMPTS,
+            MEDIA_UPLOAD_WINDOW_SECONDS,
+            "media upload rate limit exceeded",
         )
 
     async def _check_limit(self, key: str, limit: int, ttl: int, detail: str) -> None:

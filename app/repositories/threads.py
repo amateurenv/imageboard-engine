@@ -1,6 +1,6 @@
 """sql запросы для тредов и постов"""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 from asyncpg import Connection, Pool, Record
@@ -138,6 +138,23 @@ VALUES ($1, $2)
 ON CONFLICT DO NOTHING
 """
 
+LIST_PUBLIC_MEDIA_SQL = """
+SELECT media.post_id, media.public_key, media.mime_type
+FROM media
+JOIN posts AS post ON post.id=media.post_id
+JOIN threads AS thread ON thread.id=post.thread_id
+JOIN boards AS board ON board.id=thread.board_id
+WHERE media.post_id = ANY($1::bigint[])
+  AND media.processing_state='ready'
+  AND media.public_key IS NOT NULL
+  AND media.display_path IS NOT NULL
+  AND media.preview_path IS NOT NULL
+  AND post.is_hidden=FALSE
+  AND thread.is_hidden=FALSE
+  AND board.is_active=TRUE
+ORDER BY media.attachment_position ASC NULLS LAST, media.id ASC
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class ThreadRecord:
@@ -167,6 +184,14 @@ class PostingBoardRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class PublicMediaRecord:
+    """только opaque key и mime ready derivative для публичного ответа поста"""
+
+    public_key: str
+    mime_type: str
+
+
+@dataclass(frozen=True, slots=True)
 class PostRecord:
     """данные одного поста, полученные из postgresql"""
 
@@ -174,6 +199,7 @@ class PostRecord:
     author_name: str | None
     body: str
     created_at: datetime
+    media: tuple[PublicMediaRecord, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,11 +376,32 @@ class ThreadsRepository:
                     limit + 1,
                 )
 
+        reply_records = [_post_record(row) for row in reply_rows]
+        records = ([op] if op is not None else []) + reply_records
+        media_by_post = await self.get_public_media_for_posts([record.id for record in records])
         return ThreadPageRecord(
             thread=_thread_record(thread_row),
-            op=op,
-            replies=[_post_record(row) for row in reply_rows],
+            op=None if op is None else replace(op, media=media_by_post.get(op.id, ())),
+            replies=[
+                replace(record, media=media_by_post.get(record.id, ()))
+                for record in reply_records
+            ],
         )
+
+    async def get_public_media_for_posts(
+        self, post_ids: list[int]
+    ) -> dict[int, tuple[PublicMediaRecord, ...]]:
+        """получить все публичные derivative одним запросом без N+1"""
+
+        if not post_ids:
+            return {}
+        rows = await self._postgres_pool.fetch(LIST_PUBLIC_MEDIA_SQL, post_ids)
+        grouped: dict[int, list[PublicMediaRecord]] = {}
+        for row in rows:
+            grouped.setdefault(row["post_id"], []).append(
+                PublicMediaRecord(row["public_key"], row["mime_type"])
+            )
+        return {post_id: tuple(media) for post_id, media in grouped.items()}
 
     async def create_thread(
         self,

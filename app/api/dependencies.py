@@ -13,11 +13,12 @@ from app.core.config import get_settings
 from app.core.security import CSRF_COOKIE, CSRF_HEADER, SESSION_COOKIE, hash_token
 from app.core.site_settings import SiteSettings
 from app.repositories.ip_bans import IpBansRepository
-from app.repositories.media import MediaRepository
+from app.repositories.media_delivery import MediaDeliveryRepository
 from app.repositories.profiles import ProfilesRepository
 from app.repositories.threads import ThreadsRepository
 from app.repositories.users import UserRecord, UsersRepository
-from app.services.media import MediaService
+from app.services.media_delivery import MediaDeliveryService
+from app.services.media_upload import MediaUploadService
 from app.services.posting_claims import PostingClaimsService
 from app.services.profile_moderation import ProfileModerationService
 from app.services.profiles import ProfilesService
@@ -348,16 +349,37 @@ type SpamServiceDependency = Annotated[
 ]
 
 
-def get_media_service(
+def get_media_upload_service(
+    request: Request,
     postgres_pool: PostgresPoolDependency,
     redis_client: RedisClientDependency,
-) -> MediaService:
-    """создать сервис загрузки медиа"""
+    site_settings: SiteSettingsDependency,
+) -> MediaUploadService:
+    """создать upload service с закрытым storage из настроек процесса"""
 
-    return MediaService(MediaRepository(postgres_pool), redis_client)
+    return MediaUploadService(
+        postgres_pool,
+        redis_client,
+        site_settings,
+        request.app.state.media_storage_root,
+    )
 
 
-type MediaServiceDependency = Annotated[
-    MediaService,
-    Depends(get_media_service),
+type MediaUploadServiceDependency = Annotated[
+    MediaUploadService,
+    Depends(get_media_upload_service),
+]
+
+
+def get_media_delivery_service(
+    postgres_pool: PostgresPoolDependency,
+) -> MediaDeliveryService:
+    """создать read-only service проверки media перед nginx internal redirect"""
+
+    return MediaDeliveryService(MediaDeliveryRepository(postgres_pool))
+
+
+type MediaDeliveryServiceDependency = Annotated[
+    MediaDeliveryService,
+    Depends(get_media_delivery_service),
 ]

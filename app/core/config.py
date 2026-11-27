@@ -2,6 +2,7 @@
 
 # lru_cache сохраняет результат, Literal ограничивает список допустимых строк
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal, Self
 
 # BaseSettings читает переменные окружения, SettingsConfigDict задаёт правила
@@ -28,6 +29,9 @@ class Settings(BaseSettings):
 
     # адрес redis из REDIS_URL в .env
     redis_url: RedisDsn
+
+    # корень закрытого media storage, не подключать к static или reverse proxy на этом этапе
+    media_storage_root: Path = Path("media")
 
     @model_validator(mode="after")
     def reject_debug_in_production(self) -> Self:

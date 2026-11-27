@@ -7,6 +7,7 @@ from asyncpg import Pool
 from fastapi import FastAPI
 
 from app.api.admin_ui import router as admin_ui_router
+from app.api.media_delivery import router as media_delivery_router
 from app.api.system import router as system_router
 from app.api.v1.router import router as api_v1_router
 from app.core.config import get_settings
@@ -41,6 +42,8 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         application.state.site_settings = await load_site_settings(
             application.state.postgres_pool
         )
+        # upload и worker используют один закрытый корень, который пока не раздаётся наружу
+        application.state.media_storage_root = settings.media_storage_root
     except Exception:
         # закрываем уже созданные подключения при неудачном запуске
         if postgres_pool is not None:
@@ -80,6 +83,8 @@ app = FastAPI(
 app.include_router(system_router)
 # локальная админ-страница использует те же защищённые api-маршруты
 app.include_router(admin_ui_router)
+# этот маршрут возвращает только X-Accel-Redirect, байты отдаёт internal nginx
+app.include_router(media_delivery_router)
 
 # подключаем первую версию публичного API
 app.include_router(api_v1_router)

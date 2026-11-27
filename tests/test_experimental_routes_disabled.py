@@ -1,10 +1,10 @@
-"""проверка временно выключенных экспериментальных маршрутов"""
+"""проверка выключенных generic media и realtime маршрутов"""
 
 from app.main import app
 
 
-def test_media_and_realtime_routes_are_not_registered() -> None:
-    """небезопасные медиа и realtime маршруты не доступны публично"""
+def test_generic_media_and_realtime_routes_are_not_registered() -> None:
+    """узкий board upload не включает старый generic media или realtime маршрут"""
 
     registered_paths = {
         route.path

@@ -1,16 +1,19 @@
-"""воркер создания превью загруженных файлов из redis-очереди"""
+"""worker безопасно перекодирует image из quarantine в закрытые производные файлы"""
 
 import asyncio
 import logging
+import os
 from datetime import timedelta
-from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 from app.core.config import get_settings
 from app.core.database import close_postgres_pool, create_postgres_pool
 from app.core.redis import close_redis_client, create_redis_client
 from app.repositories.media import MediaRepository
+from app.services.image_validation import validate_image
+from app.services.media_scanner import MediaScanner, NoopMediaScanner
+from app.services.media_storage import MediaStorage
 
 # redis будит worker раньше следующей проверки, но postgresql остаётся источником истины
 QUEUE_KEY = "media:previews"
@@ -20,41 +23,90 @@ MAX_PROCESSING_ATTEMPTS = 3
 PROCESSING_LEASE = timedelta(minutes=10)
 # даже без redis worker проверит очередь и вернёт зависшие задачи
 IDLE_WAIT_SECONDS = 1
-# превью лежат отдельно от оригиналов, поэтому их можно пересобрать
-PREVIEW_DIR = Path("media/previews")
-# thumbnail сохранит пропорции и впишет картинку в эти границы
+# preview нужен спискам, display не даёт раздавать исходный пользовательский файл
 PREVIEW_SIZE = (320, 180)
+DISPLAY_SIZE = (2560, 2560)
 logger = logging.getLogger(__name__)
 
 
-def make_preview(media_id: int, path: str) -> None:
-    """создать превью картинки на диск"""
+def _save_webp(image: Image.Image, storage: MediaStorage, relative_path: str) -> None:
+    """сохранить новый WebP через временный файл без metadata оригинала"""
 
-    PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    temporary_path = storage.temporary_path(relative_path)
+    try:
+        image.save(temporary_path, "WEBP", quality=85, method=6)
+        os.chmod(temporary_path, 0o600)
+        storage.replace_from_temporary(temporary_path, relative_path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
 
-    with Image.open(path) as image:
-        image.thumbnail(PREVIEW_SIZE)
-        image.save(PREVIEW_DIR / f"{media_id}.jpg", "JPEG", quality=85)
+
+def make_derivatives(source_path: str, storage: MediaStorage, media_id: int) -> tuple[str, str]:
+    """декодировать image и создать display с preview без EXIF и ICC metadata"""
+
+    display_path = f"display/{media_id}.webp"
+    preview_path = f"previews/{media_id}.webp"
+    try:
+        with Image.open(source_path) as source:
+            source.load()
+            # новый объект не переносит EXIF, ICC и произвольные поля из исходного файла
+            normalized = ImageOps.exif_transpose(source).copy()
+            if normalized.mode not in {"RGB", "RGBA"}:
+                normalized = normalized.convert("RGBA" if "transparency" in source.info else "RGB")
+
+            display = normalized.copy()
+            display.thumbnail(DISPLAY_SIZE)
+            _save_webp(display, storage, display_path)
+
+            preview = normalized.copy()
+            preview.thumbnail(PREVIEW_SIZE)
+            _save_webp(preview, storage, preview_path)
+    except Exception:
+        storage.delete_file(display_path)
+        storage.delete_file(preview_path)
+        raise
+    return display_path, preview_path
 
 
-async def process_job(repository: MediaRepository, media_id: int) -> None:
-    """обработать задание: создать превью одного файла"""
+async def process_job(
+    repository: MediaRepository,
+    media_id: int,
+    storage: MediaStorage,
+    scanner: MediaScanner | None = None,
+) -> None:
+    """создать производные файлы и пометить запись ready только в самом конце"""
 
     media = await repository.get_by_id(media_id)
     if media is None:
         return
-
-    # превью для картинок; видео через ffmpeg — позже (Stage 7+)
-    if media.mime_type.startswith("image/"):
-        # Pillow читает файл синхронно, выносим работу из event loop
-        await asyncio.to_thread(make_preview, media.id, str(Path("media") / media.path))
+    source_path = storage.resolve(media.path)
+    # production scanner подключат здесь - до derivative и перевода media в ready
+    await asyncio.to_thread((scanner or NoopMediaScanner()).scan, source_path)
+    # проверка повторяется в worker, потому что очередь может пережить обновление процесса
+    await asyncio.to_thread(validate_image, source_path)
+    display_path, preview_path = await asyncio.to_thread(
+        make_derivatives, str(source_path), storage, media.id
+    )
+    try:
+        # оригинал из quarantine не нужен после успешного server-side re-encode
+        storage.delete_file(media.path)
+        ready = await repository.mark_ready(
+            media.id, display_path=display_path, preview_path=preview_path
+        )
+        if ready is None:
+            raise RuntimeError("media processing lease was lost")
+    except Exception:
+        storage.delete_file(display_path)
+        storage.delete_file(preview_path)
+        raise
 
 
 async def run_worker() -> None:
-    """бесконечный цикл обработки очереди"""
+    """бесконечный цикл обработки закрытой postgresql очереди"""
 
     settings = get_settings()
-
+    storage = MediaStorage(settings.media_storage_root)
     redis_client = create_redis_client(settings)
     pool = await create_postgres_pool(settings)
     repository = MediaRepository(pool)
@@ -76,7 +128,7 @@ async def run_worker() -> None:
                 await redis_client.brpop(QUEUE_KEY, timeout=IDLE_WAIT_SECONDS)
                 continue
             try:
-                await process_job(repository, media.id)
+                await process_job(repository, media.id, storage)
             except Exception as error:
                 result = await repository.fail_processing(
                     media.id,
@@ -87,8 +139,6 @@ async def run_worker() -> None:
                     # запись уже сохранена в postgresql, поэтому ошибка lpush не потеряет retry
                     await redis_client.lpush(QUEUE_KEY, media.id)
                 logger.exception("media job %s failed", media.id)
-            else:
-                await repository.mark_ready(media.id)
     finally:
         await close_postgres_pool(pool)
         await close_redis_client(redis_client)

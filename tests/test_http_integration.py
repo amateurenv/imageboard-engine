@@ -3,11 +3,13 @@
 import asyncio
 import os
 import uuid
+from io import BytesIO
 from pathlib import Path
 
 import asyncpg
 import pytest
 from httpx import ASGITransport, AsyncClient
+from PIL import Image
 from redis.asyncio import Redis
 
 from app.api.dependencies import (
@@ -19,16 +21,20 @@ from app.api.dependencies import (
 from app.core.security import CSRF_COOKIE, hash_password, hash_token
 from app.core.site_settings import SiteSettings
 from app.main import app
+from app.repositories.media import MediaRepository
 from app.repositories.posting_claims import PostingClaimsRepository
 from app.repositories.users import UsersRepository
+from app.services.media_storage import MediaStorage
 from app.ws.manager import DisabledWebSocketManager
+from scripts.cleanup_media_files import cleanup_media_files
+from scripts.media_worker import MAX_PROCESSING_ATTEMPTS, PROCESSING_LEASE, process_job
 
 pytestmark = pytest.mark.integration
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture
-async def http_client() -> AsyncClient:
+async def http_client(tmp_path: Path) -> AsyncClient:
     """дать api отдельные postgres-схему и redis database"""
 
     database_url = os.getenv("TEST_DATABASE_URL")
@@ -59,6 +65,7 @@ async def http_client() -> AsyncClient:
     app.state.postgres_pool = pool
     app.state.redis_client = redis
     app.state.site_settings = settings
+    app.state.media_storage_root = tmp_path / "media"
     app.state.ws_manager = DisabledWebSocketManager()
     app.dependency_overrides = {
         get_postgres_pool: lambda: pool,
@@ -108,6 +115,36 @@ async def register(client: AsyncClient, handle: str, password: str = "profile-pa
         json={"handle": handle, "password": password},
     )
     assert response.status_code == 201
+
+
+def image_bytes(image_format: str) -> bytes:
+    """создать маленькое корректное изображение для настоящего multipart запроса"""
+
+    result = BytesIO()
+    Image.new("RGB", (8, 8), "red").save(result, image_format)
+    return result.getvalue()
+
+
+async def upload_ready_image(client: AsyncClient, board_slug: str, token: str) -> int:
+    """загрузить JPEG и вручную завершить worker для HTTP integration сценария"""
+
+    uploaded = await client.post(
+        f"/api/v1/boards/{board_slug}/media",
+        data={"posting_claim_token": token},
+        files={"file": ("image.jpg", image_bytes("JPEG"), "image/jpeg")},
+    )
+    assert uploaded.status_code == 201
+    media_id = uploaded.json()["id"]
+    repository = MediaRepository(app.state.postgres_pool)
+    storage = MediaStorage(app.state.media_storage_root)
+    claimed = await repository.claim_by_id(
+        media_id,
+        max_attempts=MAX_PROCESSING_ATTEMPTS,
+        lease_duration=PROCESSING_LEASE,
+    )
+    assert claimed is not None
+    await process_job(repository, media_id, storage)
+    return media_id
 
 
 @pytest.mark.anyio
@@ -595,3 +632,174 @@ async def test_posting_claim_consumes_ready_media_atomically(http_client: AsyncC
     assert await app.state.postgres_pool.fetchval(
         "SELECT count(*) FROM media WHERE id=$1", account_media_id
     ) == 0
+
+
+@pytest.mark.anyio
+async def test_image_upload_quarantine_worker_attach_and_cleanup(http_client: AsyncClient) -> None:
+    """image upload остаётся закрытым до worker и удаляется через db cleanup queue"""
+
+    board_slug = f"images-{uuid.uuid4().hex[:10]}"
+    owner_csrf = await login(http_client, "owner", "owner-password")
+    board = await http_client.post(
+        "/api/v1/admin/boards",
+        headers=owner_csrf,
+        json={"slug": board_slug, "title": "Images"},
+    )
+    assert board.status_code == 200
+    assert (await http_client.post("/api/v1/auth/logout", headers=owner_csrf)).status_code == 204
+
+    claim = await http_client.post(f"/api/v1/boards/{board_slug}/posting-claims")
+    assert claim.status_code == 201
+    token = claim.json()["token"]
+
+    uploads = []
+    for image_format, filename, declared_mime in [
+        ("JPEG", "not-trusted.bin", "text/plain"),
+        ("PNG", "picture.png", "application/octet-stream"),
+        ("WEBP", "picture.webp", "image/webp"),
+    ]:
+        response = await http_client.post(
+            f"/api/v1/boards/{board_slug}/media",
+            data={"posting_claim_token": token},
+            files={"file": (filename, image_bytes(image_format), declared_mime)},
+        )
+        assert response.status_code == 201
+        assert set(response.json()) == {
+            "id", "size", "mime_type", "processing_state", "created_at"
+        }
+        assert response.json()["processing_state"] == "queued"
+        uploads.append(response.json()["id"])
+
+    unsupported = await http_client.post(
+        f"/api/v1/boards/{board_slug}/media",
+        data={"posting_claim_token": token},
+        files={"file": ("animation.gif", image_bytes("GIF"), "image/gif")},
+    )
+    assert unsupported.status_code == 415
+    assert unsupported.json()["detail"]["code"] == "unsupported_media_type"
+    broken = await http_client.post(
+        f"/api/v1/boards/{board_slug}/media",
+        data={"posting_claim_token": token},
+        files={"file": ("pretend.jpg", b"not an image", "image/jpeg")},
+    )
+    assert broken.status_code == 422
+    assert broken.json()["detail"]["code"] == "invalid_media"
+
+    repository = MediaRepository(app.state.postgres_pool)
+    storage = MediaStorage(app.state.media_storage_root)
+    for media_id in uploads:
+        claimed = await repository.claim_by_id(
+            media_id,
+            max_attempts=MAX_PROCESSING_ATTEMPTS,
+            lease_duration=PROCESSING_LEASE,
+        )
+        assert claimed is not None
+        quarantine_path = storage.resolve(claimed.path)
+        assert quarantine_path.exists()
+        await process_job(repository, media_id, storage)
+        ready = await repository.get_by_id(media_id)
+        assert ready is not None and ready.processing_state.value == "ready"
+        assert ready.display_path is not None and ready.preview_path is not None
+        assert storage.resolve(ready.display_path).is_file()
+        assert storage.resolve(ready.preview_path).is_file()
+        assert not quarantine_path.exists()
+
+    created = await http_client.post(
+        f"/api/v1/boards/{board_slug}/threads",
+        json={
+            "body": "images",
+            "deletion_password": "image-delete",
+            "posting_claim_token": token,
+            "media_ids": uploads,
+        },
+    )
+    assert created.status_code == 201
+    thread_id = created.json()["thread"]["id"]
+    post_media = created.json()["posts"][0]["media"]
+    assert len(post_media) == 3
+    display = await http_client.get(post_media[0]["display_url"])
+    preview = await http_client.head(post_media[0]["preview_url"])
+    assert display.status_code == 200
+    assert display.headers["x-accel-redirect"].startswith("/_imageboard_media/display/")
+    assert display.headers["content-type"] == "image/webp"
+    assert "quarantine" not in str(display.headers)
+    assert preview.status_code == 200
+    assert preview.headers["x-accel-redirect"].startswith("/_imageboard_media/previews/")
+    assert (await http_client.get(f"/media/{uploads[0]}/display")).status_code == 404
+    deleted = await http_client.request(
+        "DELETE", f"/api/v1/threads/{thread_id}", json={"deletion_password": "image-delete"}
+    )
+    assert deleted.status_code == 204
+    assert (await http_client.get(post_media[0]["display_url"])).status_code == 404
+    assert await app.state.postgres_pool.fetchval("SELECT count(*) FROM media") == 0
+    await cleanup_media_files(repository=repository, storage=storage)
+    assert not [path for path in storage.root.rglob("*") if path.is_file()]
+
+
+@pytest.mark.anyio
+async def test_media_delivery_closes_after_profile_hide_and_delete(
+    http_client: AsyncClient,
+) -> None:
+    """owner hide/delete сразу закрывает delivery до физической cleanup очереди"""
+
+    await register(http_client, "alice")
+    csrf = await login(http_client, "alice", "profile-password")
+    thread_claim = await http_client.post("/api/v1/boards/alice/posting-claims")
+    assert thread_claim.status_code == 201
+    thread_media_id = await upload_ready_image(http_client, "alice", thread_claim.json()["token"])
+    created = await http_client.post(
+        "/api/v1/boards/alice/threads",
+        json={
+            "body": "image thread",
+            "posting_claim_token": thread_claim.json()["token"],
+            "media_ids": [thread_media_id],
+        },
+    )
+    assert created.status_code == 201
+    thread_id = created.json()["thread"]["id"]
+    thread_url = created.json()["posts"][0]["media"][0]["display_url"]
+    assert (await http_client.get(thread_url)).status_code == 200
+
+    hidden_thread = await http_client.patch(
+        f"/api/v1/profiles/alice/threads/{thread_id}",
+        headers=csrf,
+        json={"is_hidden": True},
+    )
+    assert hidden_thread.status_code == 200
+    assert (await http_client.get(thread_url)).status_code == 404
+    restored_thread = await http_client.patch(
+        f"/api/v1/profiles/alice/threads/{thread_id}",
+        headers=csrf,
+        json={"is_hidden": False},
+    )
+    assert restored_thread.status_code == 200
+    assert (await http_client.get(thread_url)).status_code == 200
+
+    reply_claim = await http_client.post("/api/v1/boards/alice/posting-claims")
+    assert reply_claim.status_code == 201
+    reply_media_id = await upload_ready_image(http_client, "alice", reply_claim.json()["token"])
+    reply = await http_client.post(
+        f"/api/v1/threads/{thread_id}/posts",
+        json={
+            "body": "image reply",
+            "posting_claim_token": reply_claim.json()["token"],
+            "media_ids": [reply_media_id],
+        },
+    )
+    assert reply.status_code == 200
+    reply_id = reply.json()["id"]
+    reply_url = reply.json()["media"][0]["preview_url"]
+    assert (await http_client.get(reply_url)).status_code == 200
+    hidden_reply = await http_client.patch(
+        f"/api/v1/profiles/alice/posts/{reply_id}",
+        headers=csrf,
+        json={"is_hidden": True},
+    )
+    assert hidden_reply.status_code == 200
+    assert (await http_client.get(reply_url)).status_code == 404
+
+    deleted_thread = await http_client.delete(
+        f"/api/v1/profiles/alice/threads/{thread_id}", headers=csrf
+    )
+    assert deleted_thread.status_code == 204
+    assert (await http_client.get(thread_url)).status_code == 404

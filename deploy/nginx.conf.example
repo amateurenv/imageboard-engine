@@ -5,7 +5,28 @@ server {
 
     ssl_certificate /etc/letsencrypt/live/example.org/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/example.org/privkey.pem;
-    client_max_body_size 2m;
+    # это верхняя граница всего multipart запроса, policy приложения дополнительно проверяет файл
+    client_max_body_size 21m;
+
+    # подставь абсолютный production путь MEDIA_STORAGE_ROOT
+    # этот URL нельзя открыть снаружи: FastAPI выдаёт его только через X-Accel-Redirect
+    location ~ ^/_imageboard_media/(display|previews)/([1-9][0-9]*)\.webp$ {
+        internal;
+        alias /srv/imageboard-media/$1/$2.webp;
+        autoindex off;
+        default_type image/webp;
+        add_header Content-Disposition "inline" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        limit_except GET HEAD { deny all; }
+    }
+
+    # любой другой внутренний путь, включая quarantine и originals, остаётся недоступным
+    location /_imageboard_media/ {
+        internal;
+        autoindex off;
+        return 404;
+    }
 
     location / {
         proxy_pass http://127.0.0.1:8000;

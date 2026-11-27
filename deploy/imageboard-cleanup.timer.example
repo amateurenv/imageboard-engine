@@ -1,5 +1,5 @@
 [Unit]
-Description=Run Imageboard staff-session cleanup every hour
+Description=Run Imageboard cleanup every hour
 
 [Timer]
 OnCalendar=hourly

@@ -13,8 +13,15 @@ from app.core.pagination import (
 from app.core.security import hash_password
 from app.core.site_settings import SiteSettings
 from app.core.urls import thread_canonical_url
-from app.repositories.threads import PostCreationResult, PostRecord, ThreadRecord, ThreadsRepository
+from app.repositories.threads import (
+    PostCreationResult,
+    PostRecord,
+    PublicMediaRecord,
+    ThreadRecord,
+    ThreadsRepository,
+)
 from app.repositories.users import UserRecord
+from app.schemas.media import PublicMediaUrls
 from app.schemas.threads import (
     PostCreate,
     PostSummary,
@@ -192,12 +199,18 @@ class ThreadsService:
             deletion_password_hash=deletion_password_hash,
             )
 
+        media_by_post = (
+            await self._repository.get_public_media_for_posts([creation_result.post.id])
+            if thread_create.media_ids
+            else {}
+        )
         return ThreadWithPosts(
             thread=self._to_detail(creation_result.thread),
             posts=[
                 self._to_post_summary(
                     creation_result.post,
                     self._thread_url(creation_result.thread),
+                    media_by_post.get(creation_result.post.id, ()),
                 )
             ],
         )
@@ -255,7 +268,15 @@ class ThreadsService:
             return None
 
         # транслируем realtime-событие только после успешного коммита поста
-        post_summary = self._to_post_summary(creation_result.post)
+        media_by_post = (
+            await self._repository.get_public_media_for_posts([creation_result.post.id])
+            if post_create.media_ids
+            else {}
+        )
+        post_summary = self._to_post_summary(
+            creation_result.post,
+            media=media_by_post.get(creation_result.post.id, ()),
+        )
         await self._ws_manager.broadcast(
             {
                 "event": "post_created",
@@ -322,7 +343,12 @@ class ThreadsService:
             canonical_url=self._thread_url(thread),
         )
 
-    def _to_post_summary(self, post: PostRecord, thread_url: str = "") -> PostSummary:
+    def _to_post_summary(
+        self,
+        post: PostRecord,
+        thread_url: str = "",
+        media: tuple[PublicMediaRecord, ...] | None = None,
+    ) -> PostSummary:
         """данные поста, для анонимов — имя из localization"""
 
         return PostSummary(
@@ -331,6 +357,13 @@ class ThreadsService:
             body=post.body,
             created_at=post.created_at,
             thread_canonical_url=thread_url,
+            media=[
+                PublicMediaUrls(
+                    preview_url=f"/media/{item.public_key}/preview",
+                    display_url=f"/media/{item.public_key}/display",
+                )
+                for item in (post.media if media is None else media)
+            ],
         )
 
     @staticmethod

@@ -4,6 +4,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.schemas.media import PublicMediaUrls
+
 
 class ThreadSummary(BaseModel):
     """тред в списке доски"""
@@ -46,6 +48,7 @@ class PostSummary(BaseModel):
     body: str
     created_at: datetime
     thread_canonical_url: str = ""
+    media: list[PublicMediaUrls] = Field(default_factory=list)
 
 
 class ThreadWithPosts(BaseModel):

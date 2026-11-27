@@ -39,4 +39,18 @@ Redis не переносится как база данных. В движке 
    ```bash
    .venv/bin/python -m scripts.cleanup_sessions
    .venv/bin/python -m scripts.cleanup_posting_claims
+   .venv/bin/python -m scripts.cleanup_media_files
+   ```
+
+   Image upload принимает только JPEG, PNG и WebP. Файлы хранятся в закрытом
+   quarantine до worker. Ready preview/display выдаются только через FastAPI
+   check и internal Nginx template - оригиналы и quarantine никогда не раздаются.
+   На новом компьютере отдельно укажи абсолютный `MEDIA_STORAGE_ROOT` в Nginx
+   template и не публикуй его через public alias. Telegram media и антивирус
+   ещё не настроены
+
+10. Если используется upload, отдельно запусти worker с тем же `.env`:
+
+   ```bash
+   .venv/bin/python -m scripts.media_worker
    ```

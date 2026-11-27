@@ -91,7 +91,13 @@ class PostingClaimsService:
                     body=body, author_user_id=None if actor is None else actor.id,
                     deletion_password_hash=deletion_hash,
                 )
-                await self._claims.attach_and_consume(connection, claim.id, result.post.id, media_ids)
+                await self._claims.attach_and_consume(
+                    connection,
+                    claim.id,
+                    result.post.id,
+                    media_ids,
+                    self._new_public_keys(media_ids),
+                )
         return result
 
     async def create_post_with_media(
@@ -109,7 +115,13 @@ class PostingClaimsService:
                     reference_ids=references, author_user_id=None if actor is None else actor.id,
                     deletion_password_hash=deletion_hash,
                 )
-                await self._claims.attach_and_consume(connection, claim.id, result.post.id, media_ids)
+                await self._claims.attach_and_consume(
+                    connection,
+                    claim.id,
+                    result.post.id,
+                    media_ids,
+                    self._new_public_keys(media_ids),
+                )
         return result
 
     async def _validate_claim(self, connection: Connection, board: ClaimBoard, actor: UserRecord | None,
@@ -133,6 +145,12 @@ class PostingClaimsService:
         return MediaPolicy.from_settings(
             self._settings.media, BoardMediaOverrides.model_validate(board.media_overrides)
         )
+
+    @staticmethod
+    def _new_public_keys(media_ids: list[int]) -> dict[int, str]:
+        """создать непредсказуемые key только перед атомарным attach ready media"""
+
+        return {media_id: secrets.token_urlsafe(32) for media_id in media_ids}
 
     @staticmethod
     def _media_type(mime_type: str) -> MediaType:

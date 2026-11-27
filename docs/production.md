@@ -13,7 +13,10 @@
 5. Включи резервные копии PostgreSQL и регулярно проверь восстановление на
    отдельной машине
 6. Запускай `python -m scripts.cleanup_sessions` по таймеру
-7. Запускай `python -m scripts.cleanup_posting_claims` по таймеру после включения upload
+7. Запускай `python -m scripts.cleanup_posting_claims` и
+   `python -m scripts.cleanup_media_files` по таймеру
+8. Если нужен image upload, запусти отдельный process `python -m scripts.media_worker`
+   с тем же закрытым `MEDIA_STORAGE_ROOT`, но не публикуй этот каталог через web server
 
 ## наблюдаемость
 
@@ -21,17 +24,31 @@
 публичного запуска добавь централизованный сбор ошибок, метрики запросов,
 занятости PostgreSQL/Redis и оповещения о недоступности `/ready`.
 
-## media - не включать
+## media - ограниченный image upload
 
-Маршрут `/api/v1/media` остаётся выключенным. Posting claims уже ограничивают срок
-и атомарную привязку ready media к посту. Проверка сигнатур файлов, временная
-запись, очередь превью и recovery задач после lease уже есть, но для публичного
-включения ещё нужны:
+`/api/v1/media` остаётся выключенным, но `POST /api/v1/boards/{slug}/media`
+принимает JPEG, PNG и WebP только с действующим posting claim. Файл попадает в
+закрытый quarantine, проверяется по содержимому и после worker получает display
+и preview WebP без metadata.
 
-- проверка на вредоносные файлы, лимиты размеров изображения и защита от
-  decompression bomb;
-- обработка видео и аудио, привязка вложения к авторизованному посту;
-- квоты диска, метрики, alerting и отдельная безопасная раздача файлов через Nginx.
+Готовое attached media получает opaque key. `GET /media/{key}/preview` и
+`GET /media/{key}/display` повторно проверяют `ready`, attach и видимость в
+PostgreSQL, после чего передают Nginx только `X-Accel-Redirect` на internal
+location. FastAPI не читает файл, quarantine и оригиналы не имеют HTTP URL.
+`deploy/nginx.conf.example` - шаблон, а не применённая конфигурация: оператор
+должен заменить путь alias на абсолютный `MEDIA_STORAGE_ROOT`, закрыть права
+storage и проверить Nginx отдельно.
+
+До широкого public media запуска обязательно нужны:
+
+- антивирус или отдельный безопасный scanner - он ещё не реализован;
+- квоты диска, метрики, alerting и отдельная безопасная раздача через Nginx;
+- операционные проверки worker, восстановления после файловой ошибки и нагрузки;
+- отдельные решения для GIF, видео, stickers, Telegram media и других форматов.
+
+`NoopMediaScanner` - только extension point для development. Он не является
+антивирусом. Production scanner должен проверять quarantine-файл до worker
+перехода в `ready`.
 
 ## realtime - не включать
 
@@ -53,3 +70,5 @@
 3. cookie сессии в production имеет `Secure`, а `APP_DEBUG=false`
 4. timer очистки сессий и резервные копии действительно запускаются по расписанию
 5. восстановление последней резервной копии проходит в отдельной тестовой базе
+6. `GET /media/{opaque key}/display` работает только через proxy, а прямой URL
+   `/_imageboard_media/...` снаружи даёт `404`

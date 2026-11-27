@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from asyncpg import Pool, Record
+from asyncpg import Connection, Pool, Record
 
 from app.services.media_queue import (
     MediaProcessingState,
@@ -11,15 +11,17 @@ from app.services.media_queue import (
 )
 
 CREATE_MEDIA_SQL = """
-INSERT INTO media (path, size, mime_type)
-VALUES ($1, $2, $3)
+INSERT INTO media (path, size, mime_type, board_id, posting_claim_id)
+VALUES ($1, $2, $3, $4, $5)
 RETURNING id, path, size, mime_type, created_at, processing_state,
           processing_attempts, processing_lease_until, last_processing_error
+          , board_id, posting_claim_id, display_path, preview_path
 """
 
 GET_BY_ID_SQL = """
 SELECT id, path, size, mime_type, created_at, processing_state,
-       processing_attempts, processing_lease_until, last_processing_error
+       processing_attempts, processing_lease_until, last_processing_error,
+       board_id, posting_claim_id, display_path, preview_path
 FROM media
 WHERE id = $1
 """
@@ -43,7 +45,8 @@ WHERE candidate.id = next_media.id
 RETURNING candidate.id, candidate.path, candidate.size, candidate.mime_type,
           candidate.created_at, candidate.processing_state,
           candidate.processing_attempts, candidate.processing_lease_until,
-          candidate.last_processing_error
+          candidate.last_processing_error, candidate.board_id, candidate.posting_claim_id,
+          candidate.display_path, candidate.preview_path
 """
 
 CLAIM_MEDIA_SQL = """
@@ -55,17 +58,21 @@ WHERE id = $1
   AND processing_state = 'queued'
   AND processing_attempts < $2
 RETURNING id, path, size, mime_type, created_at, processing_state,
-          processing_attempts, processing_lease_until, last_processing_error
+          processing_attempts, processing_lease_until, last_processing_error,
+          board_id, posting_claim_id, display_path, preview_path
 """
 
 MARK_READY_SQL = """
 UPDATE media
 SET processing_state = 'ready',
     processing_lease_until = NULL,
-    last_processing_error = NULL
+    last_processing_error = NULL,
+    display_path = $2,
+    preview_path = $3
 WHERE id = $1 AND processing_state = 'processing'
 RETURNING id, path, size, mime_type, created_at, processing_state,
           processing_attempts, processing_lease_until, last_processing_error
+          , board_id, posting_claim_id, display_path, preview_path
 """
 
 FAIL_PROCESSING_SQL = """
@@ -78,7 +85,8 @@ SET processing_state = CASE
     last_processing_error = $3
 WHERE id = $1 AND processing_state = 'processing'
 RETURNING id, path, size, mime_type, created_at, processing_state,
-          processing_attempts, processing_lease_until, last_processing_error
+          processing_attempts, processing_lease_until, last_processing_error,
+          board_id, posting_claim_id, display_path, preview_path
 """
 
 RECOVER_EXPIRED_SQL = """
@@ -92,7 +100,8 @@ SET processing_state = CASE
 WHERE processing_state = 'processing'
   AND processing_lease_until <= clock_timestamp()
 RETURNING id, path, size, mime_type, created_at, processing_state,
-          processing_attempts, processing_lease_until, last_processing_error
+          processing_attempts, processing_lease_until, last_processing_error,
+          board_id, posting_claim_id, display_path, preview_path
 """
 
 RETRY_FAILED_SQL = """
@@ -103,11 +112,42 @@ SET processing_state = 'queued',
     last_processing_error = NULL
 WHERE id = $1 AND processing_state = 'failed'
 RETURNING id, path, size, mime_type, created_at, processing_state,
-          processing_attempts, processing_lease_until, last_processing_error
+          processing_attempts, processing_lease_until, last_processing_error,
+          board_id, posting_claim_id, display_path, preview_path
 """
 
 DELETE_MEDIA_SQL = """
 DELETE FROM media WHERE id = $1
+"""
+
+CLAIM_CLEANUP_TASK_SQL = """
+WITH next_task AS (
+    SELECT id
+    FROM media_cleanup_tasks
+    WHERE completed_at IS NULL
+      AND (lease_until IS NULL OR lease_until <= clock_timestamp())
+    ORDER BY created_at, id
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1
+)
+UPDATE media_cleanup_tasks AS task
+SET attempts = task.attempts + 1,
+    lease_until = clock_timestamp() + $1::interval
+FROM next_task
+WHERE task.id = next_task.id
+RETURNING task.id, task.relative_path, task.attempts
+"""
+
+COMPLETE_CLEANUP_TASK_SQL = """
+UPDATE media_cleanup_tasks
+SET completed_at = clock_timestamp(), lease_until = NULL, last_error = NULL
+WHERE id = $1 AND completed_at IS NULL
+"""
+
+FAIL_CLEANUP_TASK_SQL = """
+UPDATE media_cleanup_tasks
+SET lease_until = NULL, last_error = $2
+WHERE id = $1 AND completed_at IS NULL
 """
 
 
@@ -124,6 +164,19 @@ class MediaRecord:
     processing_attempts: int
     processing_lease_until: datetime | None
     last_processing_error: str | None
+    board_id: int | None = None
+    posting_claim_id: int | None = None
+    display_path: str | None = None
+    preview_path: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MediaCleanupTask:
+    """одна безопасная попытка удалить controlled relative path"""
+
+    id: int
+    relative_path: str
+    attempts: int
 
 
 def _to_media_record(row: Record) -> MediaRecord:
@@ -139,6 +192,10 @@ def _to_media_record(row: Record) -> MediaRecord:
         processing_attempts=row["processing_attempts"],
         processing_lease_until=row["processing_lease_until"],
         last_processing_error=row["last_processing_error"],
+        board_id=row["board_id"],
+        posting_claim_id=row["posting_claim_id"],
+        display_path=row["display_path"],
+        preview_path=row["preview_path"],
     )
 
 
@@ -148,14 +205,43 @@ class MediaRepository:
     def __init__(self, postgres_pool: Pool) -> None:
         self._postgres_pool = postgres_pool
 
-    async def create(self, *, path: str, size: int, mime_type: str) -> MediaRecord:
+    async def create(
+        self,
+        *,
+        path: str,
+        size: int,
+        mime_type: str,
+        board_id: int | None = None,
+        posting_claim_id: int | None = None,
+    ) -> MediaRecord:
         """сохранить запись о загруженном файле"""
 
-        row = await self._postgres_pool.fetchrow(CREATE_MEDIA_SQL, path, size, mime_type)
+        row = await self._postgres_pool.fetchrow(
+            CREATE_MEDIA_SQL, path, size, mime_type, board_id, posting_claim_id
+        )
         if row is None:
             # insert без ошибки всегда возвращает строку
             raise RuntimeError("media not created")
 
+        return _to_media_record(row)
+
+    async def create_in_transaction(
+        self,
+        connection: Connection,
+        *,
+        path: str,
+        size: int,
+        mime_type: str,
+        board_id: int,
+        posting_claim_id: int,
+    ) -> MediaRecord:
+        """создать queued media только рядом с уже заблокированным claim"""
+
+        row = await connection.fetchrow(
+            CREATE_MEDIA_SQL, path, size, mime_type, board_id, posting_claim_id
+        )
+        if row is None:
+            raise RuntimeError("media not created")
         return _to_media_record(row)
 
     async def get_by_id(self, media_id: int) -> MediaRecord | None:
@@ -201,11 +287,19 @@ class MediaRepository:
         )
         return None if row is None else _to_media_record(row)
 
-    async def mark_ready(self, media_id: int) -> MediaRecord | None:
+    async def mark_ready(
+        self,
+        media_id: int,
+        *,
+        display_path: str | None = None,
+        preview_path: str | None = None,
+    ) -> MediaRecord | None:
         """завершить только задачу, которую worker уже захватил"""
 
         ensure_media_transition(MediaProcessingState.PROCESSING, MediaProcessingState.READY)
-        row = await self._postgres_pool.fetchrow(MARK_READY_SQL, media_id)
+        row = await self._postgres_pool.fetchrow(
+            MARK_READY_SQL, media_id, display_path, preview_path
+        )
         return None if row is None else _to_media_record(row)
 
     async def fail_processing(
@@ -242,3 +336,21 @@ class MediaRepository:
         ensure_media_transition(MediaProcessingState.FAILED, MediaProcessingState.QUEUED)
         row = await self._postgres_pool.fetchrow(RETRY_FAILED_SQL, media_id)
         return None if row is None else _to_media_record(row)
+
+    async def claim_cleanup_task(self, *, lease_duration: timedelta) -> MediaCleanupTask | None:
+        """захватить один путь для очистки без параллельного удаления"""
+
+        row = await self._postgres_pool.fetchrow(CLAIM_CLEANUP_TASK_SQL, lease_duration)
+        if row is None:
+            return None
+        return MediaCleanupTask(row["id"], row["relative_path"], row["attempts"])
+
+    async def complete_cleanup_task(self, task_id: int) -> None:
+        """пометить задачу физической очистки завершённой"""
+
+        await self._postgres_pool.execute(COMPLETE_CLEANUP_TASK_SQL, task_id)
+
+    async def fail_cleanup_task(self, task_id: int, error: str) -> None:
+        """сохранить ошибку и вернуть задачу следующему безопасному запуску"""
+
+        await self._postgres_pool.execute(FAIL_CLEANUP_TASK_SQL, task_id, error[:1_000])

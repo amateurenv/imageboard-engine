@@ -106,6 +106,37 @@ class PostingClaimsRepository:
         )
         return None if row is None else _claim(row)
 
+    async def lock_board(self, connection: Connection, slug: str) -> ClaimBoard | None:
+        """заблокировать доску вместе с claim, чтобы policy не менялась посередине upload"""
+
+        row = await connection.fetchrow(
+            """SELECT id, board_type, owner_user_id, thread_creation_policy, reply_policy,
+                      media_overrides
+               FROM boards WHERE slug=$1 AND is_active=TRUE FOR UPDATE""",
+            slug,
+        )
+        if row is None:
+            return None
+        raw = row["media_overrides"]
+        return ClaimBoard(
+            row["id"], row["board_type"], row["owner_user_id"],
+            row["thread_creation_policy"], row["reply_policy"],
+            raw if isinstance(raw, dict) else json.loads(raw),
+        )
+
+    async def lock_unattached_media_sizes(
+        self, connection: Connection, claim_id: int
+    ) -> list[int]:
+        """прочитать уже загруженные файлы claim под той же блокировкой"""
+
+        rows = await connection.fetch(
+            """SELECT id, size FROM media
+               WHERE posting_claim_id=$1 AND post_id IS NULL
+               ORDER BY id FOR UPDATE""",
+            claim_id,
+        )
+        return [row["size"] for row in rows]
+
     async def lock_media(
         self, connection: Connection, claim_id: int, board_id: int, media_ids: list[int]
     ) -> list[ClaimMedia]:
@@ -119,13 +150,38 @@ class PostingClaimsRepository:
         return [ClaimMedia(row["id"], row["size"], row["mime_type"]) for row in rows]
 
     async def attach_and_consume(
-        self, connection: Connection, claim_id: int, post_id: int, media_ids: list[int]
+        self,
+        connection: Connection,
+        claim_id: int,
+        post_id: int,
+        media_ids: list[int],
+        public_keys: dict[int, str],
     ) -> None:
+        """прикрепить только ready media и выдать opaque key в той же транзакции"""
+
         for position, media_id in enumerate(media_ids):
             result = await connection.execute(
-                """UPDATE media SET post_id=$2, attachment_position=$3
-                   WHERE id=$1 AND posting_claim_id=$4 AND post_id IS NULL""",
-                media_id, post_id, position, claim_id,
+                """UPDATE media AS media
+                   SET post_id=$2,
+                       attachment_position=$3,
+                       public_key=CASE
+                           WHEN media.mime_type IN ('image/jpeg', 'image/png', 'image/webp')
+                            AND media.display_path IS NOT NULL
+                            AND media.preview_path IS NOT NULL
+                           THEN $5
+                           ELSE NULL
+                       END
+                   WHERE media.id=$1 AND media.posting_claim_id=$4
+                     AND media.post_id IS NULL AND media.processing_state='ready'
+                     AND EXISTS (
+                         SELECT 1
+                         FROM posts AS post
+                         JOIN threads AS thread ON thread.id=post.thread_id
+                         JOIN boards AS board ON board.id=thread.board_id
+                         WHERE post.id=$2 AND post.is_hidden=FALSE
+                           AND thread.is_hidden=FALSE AND board.is_active=TRUE
+                     )""",
+                media_id, post_id, position, claim_id, public_keys[media_id],
             )
             if result != "UPDATE 1":
                 raise RuntimeError("media attachment changed during claim consumption")

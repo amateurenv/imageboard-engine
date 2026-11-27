@@ -1,5 +1,5 @@
 [Unit]
-Description=Remove expired Imageboard staff sessions
+Description=Remove expired Imageboard sessions, claims and queued media files
 
 [Service]
 Type=oneshot
@@ -7,3 +7,5 @@ User=imageboard
 WorkingDirectory=/srv/imageboard-engine
 EnvironmentFile=/etc/imageboard-engine.env
 ExecStart=/srv/imageboard-engine/.venv/bin/python -m scripts.cleanup_sessions
+ExecStart=/srv/imageboard-engine/.venv/bin/python -m scripts.cleanup_posting_claims
+ExecStart=/srv/imageboard-engine/.venv/bin/python -m scripts.cleanup_media_files
