@@ -28,6 +28,9 @@ class FakeDeliveryRepository:
             display_path="display/42.webp",
             preview_path="previews/42.webp",
             board_type="public",
+            media_kind="image",
+            canonical_path=None,
+            canonical_mime_type=None,
         )
 
 
@@ -84,5 +87,8 @@ def test_nginx_template_keeps_derivatives_internal() -> None:
     assert "display|previews" in config
     assert "default_type image/webp;" in config
     assert 'X-Content-Type-Options "nosniff"' in config
+    assert "_imageboard_media/audio" in config
+    assert "_imageboard_media/voice" in config
+    assert "Accept-Ranges \"bytes\"" in config
     assert "quarantine" in config
     assert "location /media/" not in config

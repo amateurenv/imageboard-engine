@@ -17,6 +17,7 @@ from app.repositories.media_delivery import MediaDeliveryRepository
 from app.repositories.profiles import ProfilesRepository
 from app.repositories.threads import ThreadsRepository
 from app.repositories.users import UserRecord, UsersRepository
+from app.services.audio_processing import FFmpegMediaProcessor
 from app.services.media_delivery import MediaDeliveryService
 from app.services.media_upload import MediaUploadService
 from app.services.posting_claims import PostingClaimsService
@@ -362,6 +363,7 @@ def get_media_upload_service(
         redis_client,
         site_settings,
         request.app.state.media_storage_root,
+        FFmpegMediaProcessor(get_settings().ffmpeg_bin, get_settings().ffprobe_bin),
     )
 
 

@@ -139,7 +139,8 @@ ON CONFLICT DO NOTHING
 """
 
 LIST_PUBLIC_MEDIA_SQL = """
-SELECT media.post_id, media.public_key, media.mime_type, media.is_animation
+SELECT media.post_id, media.public_key, media.mime_type, media.is_animation,
+       media.media_kind, media.duration_seconds, media.canonical_mime_type
 FROM media
 JOIN posts AS post ON post.id=media.post_id
 JOIN threads AS thread ON thread.id=post.thread_id
@@ -147,8 +148,11 @@ JOIN boards AS board ON board.id=thread.board_id
 WHERE media.post_id = ANY($1::bigint[])
   AND media.processing_state='ready'
   AND media.public_key IS NOT NULL
-  AND media.display_path IS NOT NULL
-  AND media.preview_path IS NOT NULL
+  AND (
+      (media.media_kind='image' AND media.display_path IS NOT NULL
+       AND media.preview_path IS NOT NULL)
+      OR (media.media_kind IN ('audio', 'voice') AND media.canonical_path IS NOT NULL)
+  )
   AND post.is_hidden=FALSE
   AND thread.is_hidden=FALSE
   AND board.is_active=TRUE
@@ -190,6 +194,9 @@ class PublicMediaRecord:
     public_key: str
     mime_type: str
     is_animation: bool
+    media_kind: str
+    duration_seconds: int | None
+    canonical_mime_type: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -401,7 +408,12 @@ class ThreadsRepository:
         for row in rows:
             grouped.setdefault(row["post_id"], []).append(
                 PublicMediaRecord(
-                    row["public_key"], row["mime_type"], row["is_animation"]
+                    row["public_key"],
+                    row["mime_type"],
+                    row["is_animation"],
+                    row["media_kind"],
+                    row["duration_seconds"],
+                    row["canonical_mime_type"],
                 )
             )
         return {post_id: tuple(media) for post_id, media in grouped.items()}

@@ -139,7 +139,12 @@ class PostingClaimsService:
         if len(media) != len(media_ids):
             raise PostingClaimError("posting_claim_media_invalid", 403)
         self._policy(board).validate(
-            [MediaAttachment(self._media_type(item.mime_type, item.is_animation), item.size) for item in media]
+            [
+                MediaAttachment(
+                    self._media_type(item.mime_type, item.is_animation, item.media_kind), item.size
+                )
+                for item in media
+            ]
         )
         return claim
 
@@ -155,7 +160,11 @@ class PostingClaimsService:
         return {media_id: secrets.token_urlsafe(32) for media_id in media_ids}
 
     @staticmethod
-    def _media_type(mime_type: str, is_animation: bool) -> MediaType:
+    def _media_type(mime_type: str, is_animation: bool, media_kind: str) -> MediaType:
+        if media_kind == "audio":
+            return MediaType.AUDIO
+        if media_kind == "voice":
+            return MediaType.VOICE
         if is_animation:
             return MediaType.ANIMATION
         if mime_type.startswith("image/"):

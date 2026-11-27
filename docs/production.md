@@ -27,7 +27,7 @@
 ## media - ограниченный image upload
 
 `/api/v1/media` остаётся выключенным, но `POST /api/v1/boards/{slug}/media`
-принимает JPEG, PNG, static WebP, GIF и animated WebP только с действующим posting claim. Файл попадает в
+принимает JPEG, PNG, static WebP, GIF, animated WebP, MP3, M4A/AAC и OGG/Opus voice только с действующим posting claim. Файл попадает в
 закрытый quarantine, проверяется по содержимому и после worker получает display
 и preview WebP без metadata.
 
@@ -45,12 +45,24 @@ GIF и animated WebP проходят отдельные пределы worker: 
 остаётся статичным WebP. Это серверная защита ресурсов, а не пределы Telegram.
 Обычный байтовый предел - 20 MiB на файл, до 10 вложений и 200 MiB на пост.
 
+Audio MP3/M4A/AAC и voice OGG/Opus требуют system dependencies `ffprobe` и
+`ffmpeg`, заданные через `FFPROBE_BIN` и `FFMPEG_BIN`; это обязательные
+зависимости production и CI. FFprobe проверяет codec,
+container, duration, channels и sample rate, а worker делает canonical derivative:
+M4A/AAC для audio и OGG/Opus для voice. Лимиты Imageboard: audio до 30 минут,
+voice до 10 минут, audio до двух каналов, voice строго один канал, sample rate до
+48 kHz. Это не утверждения о лимитах Telegram. Production Nginx должен оставить
+audio/voice locations `internal` и разрешать Range только для derivative файлов.
+Известные запрещённые containers возвращают `415 unsupported_media_type`, а
+повреждённые допустимые кандидаты и случайные байты - `422 invalid_media`.
+
 До широкого public media запуска обязательно нужны:
 
 - антивирус или отдельный безопасный scanner - он ещё не реализован;
 - квоты диска, метрики, alerting и отдельная безопасная раздача через Nginx;
 - операционные проверки worker, восстановления после файловой ошибки и нагрузки;
-- отдельные решения для видео, stickers, Telegram media и других форматов.
+- отдельные решения для видео, video note, stickers, TGS/WebM, Telegram media и других форматов;
+- публичный frontend и Telegram-бот.
 
 `NoopMediaScanner` - только extension point для development. Он не является
 антивирусом. Production scanner должен проверять quarantine-файл до worker

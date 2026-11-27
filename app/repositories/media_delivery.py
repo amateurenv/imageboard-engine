@@ -14,11 +14,15 @@ class DeliverableMedia:
     mime_type: str
     display_path: str
     preview_path: str
+    media_kind: str
+    canonical_path: str | None
+    canonical_mime_type: str | None
     board_type: str
 
 
 DELIVERABLE_MEDIA_SQL = """
 SELECT media.id, media.public_key, media.mime_type, media.display_path, media.preview_path,
+       media.media_kind, media.canonical_path, media.canonical_mime_type,
        board.board_type
 FROM media
 JOIN posts AS post ON post.id=media.post_id
@@ -27,8 +31,11 @@ JOIN boards AS board ON board.id=thread.board_id
 WHERE media.public_key=$1
   AND media.processing_state='ready'
   AND media.post_id IS NOT NULL
-  AND media.display_path IS NOT NULL
-  AND media.preview_path IS NOT NULL
+  AND (
+      (media.media_kind='image' AND media.display_path IS NOT NULL
+       AND media.preview_path IS NOT NULL)
+      OR (media.media_kind IN ('audio', 'voice') AND media.canonical_path IS NOT NULL)
+  )
   AND post.is_hidden=FALSE
   AND thread.is_hidden=FALSE
   AND board.is_active=TRUE
@@ -44,6 +51,9 @@ def _deliverable(row: Record) -> DeliverableMedia:
         mime_type=row["mime_type"],
         display_path=row["display_path"],
         preview_path=row["preview_path"],
+        media_kind=row["media_kind"],
+        canonical_path=row["canonical_path"],
+        canonical_mime_type=row["canonical_mime_type"],
         board_type=row["board_type"],
     )
 

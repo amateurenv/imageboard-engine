@@ -109,6 +109,42 @@ def test_broken_or_polyglot_image_is_rejected(tmp_path: Path) -> None:
     assert invalid.value.code is MediaPolicyCode.INVALID_MEDIA
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\x00\x00\x00\x18ftypisom",
+        b"RIFF\x00\x00\x00\x00WAVE",
+        b"fLaC\x00\x00\x00\x22",
+        b"\x1aE\xdf\xa3\x93B\x82\x88webm",
+        b"PK\x03\x04archive",
+    ],
+)
+def test_known_disallowed_containers_return_unsupported_type(
+    tmp_path: Path, payload: bytes
+) -> None:
+    """video wav flac webm и archive не доходят до дорогого decoder"""
+
+    path = tmp_path / "fake-name.jpg"
+    path.write_bytes(payload)
+
+    with pytest.raises(MediaPolicyError) as error:
+        validate_image(path)
+
+    assert error.value.code is MediaPolicyCode.UNSUPPORTED_MEDIA_TYPE
+
+
+def test_unknown_bytes_return_invalid_media(tmp_path: Path) -> None:
+    """неизвестные байты не становятся поддерживаемым type из-за расширения"""
+
+    path = tmp_path / "audio.mp3"
+    path.write_bytes(b"random unknown bytes")
+
+    with pytest.raises(MediaPolicyError) as error:
+        validate_image(path)
+
+    assert error.value.code is MediaPolicyCode.INVALID_MEDIA
+
+
 def test_dimension_limit_rejects_small_file_with_excessive_width(tmp_path: Path) -> None:
     """разрешение проверяется отдельно от размера upload"""
 

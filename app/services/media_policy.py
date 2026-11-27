@@ -18,6 +18,8 @@ class MediaType(StrEnum):
     ANIMATION = "animation"
     STICKER = "sticker"
     VIDEO_NOTE = "video_note"
+    AUDIO = "audio"
+    VOICE = "voice"
 
 
 class MediaPolicyCode(StrEnum):
@@ -30,6 +32,7 @@ class MediaPolicyCode(StrEnum):
     MEDIA_UPLOAD_DISABLED = "media_upload_disabled"
     MEDIA_RATE_LIMITED = "media_rate_limited"
     INVALID_MEDIA = "invalid_media"
+    MEDIA_PROCESSING_UNAVAILABLE = "media_processing_unavailable"
 
 
 @dataclass(frozen=True, slots=True)

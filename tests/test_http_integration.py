@@ -1,7 +1,9 @@
 """сквозная проверка http api с настоящими postgresql и redis"""
 
 import asyncio
+import json
 import os
+import subprocess
 import uuid
 from io import BytesIO
 from pathlib import Path
@@ -142,6 +144,44 @@ def animated_image_bytes(image_format: str) -> bytes:
         optimize=False,
     )
     return result.getvalue()
+
+
+def make_audio_file(tmp_path: Path, media_type: str) -> bytes:
+    """сгенерировать короткий реальный source через установленный системный FFmpeg"""
+
+    if media_type == "mp3":
+        suffix, arguments = ".mp3", ["-c:a", "libmp3lame"]
+    elif media_type == "m4a":
+        suffix, arguments = ".m4a", ["-c:a", "aac"]
+    else:
+        suffix, arguments = ".ogg", ["-c:a", "libopus", "-ac", "1"]
+    output = tmp_path / f"source-{media_type}{suffix}"
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-nostdin", "-y", "-f", "lavfi",
+            "-i", "sine=frequency=440:duration=0.2", *arguments, str(output),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return output.read_bytes()
+
+
+def probe_audio(path: Path) -> tuple[set[str], str]:
+    """прочитать container и codec готового derivative настоящим FFprobe"""
+
+    completed = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-show_entries", "format=format_name:stream=codec_name",
+            "-of", "json", str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(completed.stdout)
+    return set(payload["format"]["format_name"].split(",")), payload["streams"][0]["codec_name"]
 
 
 async def upload_ready_image(
@@ -695,6 +735,7 @@ async def test_image_upload_quarantine_worker_attach_and_cleanup(http_client: As
         assert response.status_code == 201
         assert set(response.json()) == {
             "id", "size", "mime_type", "processing_state", "created_at"
+            , "media_kind"
         }
         assert response.json()["processing_state"] == "queued"
         uploads.append(response.json()["id"])
@@ -706,6 +747,18 @@ async def test_image_upload_quarantine_worker_attach_and_cleanup(http_client: As
     )
     assert unsupported.status_code == 415
     assert unsupported.json()["detail"]["code"] == "unsupported_media_type"
+    for payload in [
+        b"RIFF\x00\x00\x00\x00WAVE",
+        b"fLaC\x00\x00\x00\x22",
+        b"\x1aE\xdf\xa3\x93B\x82\x88webm",
+    ]:
+        rejected = await http_client.post(
+            f"/api/v1/boards/{board_slug}/media",
+            data={"posting_claim_token": token},
+            files={"file": ("fake.mp3", payload, "audio/mpeg")},
+        )
+        assert rejected.status_code == 415
+        assert rejected.json()["detail"]["code"] == "unsupported_media_type"
     broken = await http_client.post(
         f"/api/v1/boards/{board_slug}/media",
         data={"posting_claim_token": token},
@@ -713,6 +766,14 @@ async def test_image_upload_quarantine_worker_attach_and_cleanup(http_client: As
     )
     assert broken.status_code == 422
     assert broken.json()["detail"]["code"] == "invalid_media"
+    for payload in [b"ID3broken", b"\x00\x00\x00\x18ftypM4A broken", b"OggSbroken"]:
+        broken_audio = await http_client.post(
+            f"/api/v1/boards/{board_slug}/media",
+            data={"posting_claim_token": token},
+            files={"file": ("wrong.jpg", payload, "image/jpeg")},
+        )
+        assert broken_audio.status_code == 422
+        assert broken_audio.json()["detail"]["code"] == "invalid_media"
 
     repository = MediaRepository(app.state.postgres_pool)
     storage = MediaStorage(app.state.media_storage_root)
@@ -819,6 +880,155 @@ async def test_worker_retries_then_fails_modified_animation_without_derivatives(
             assert result.processing_state.value == "failed"
         assert not storage.resolve(f"display/{media_id}.webp").exists()
         assert not storage.resolve(f"previews/{media_id}.webp").exists()
+
+
+@pytest.mark.anyio
+async def test_audio_content_delivery_requires_ready_visible_attachment(
+    http_client: AsyncClient,
+) -> None:
+    """canonical audio выдаётся через content, а delete немедленно закрывает opaque URL"""
+
+    board_slug = f"audio-delivery-{uuid.uuid4().hex[:8]}"
+    csrf = await login(http_client, "owner", "owner-password")
+    board = await http_client.post(
+        "/api/v1/admin/boards",
+        headers=csrf,
+        json={"slug": board_slug, "title": "Audio delivery"},
+    )
+    assert board.status_code == 200
+    assert (await http_client.post("/api/v1/auth/logout", headers=csrf)).status_code == 204
+    created = await http_client.post(
+        f"/api/v1/boards/{board_slug}/threads",
+        json={"body": "audio", "deletion_password": "audio-delete"},
+    )
+    assert created.status_code == 201
+    thread_id = created.json()["thread"]["id"]
+    post_id = created.json()["posts"][0]["id"]
+    public_key = "audioMediaKey_4x9JRfdTQeW2pNu8LmcZVabH7sK1"
+    media_id = await app.state.postgres_pool.fetchval(
+        """INSERT INTO media (
+               post_id,path,size,mime_type,processing_state,public_key,media_kind,
+               canonical_path,canonical_mime_type,duration_seconds
+           ) VALUES ($1,'quarantine/private',12,'audio/mpeg','ready',$2,'audio',
+                     'audio/pending.m4a','audio/mp4',12)
+           RETURNING id""",
+        post_id,
+        public_key,
+    )
+    assert media_id is not None
+    await app.state.postgres_pool.execute(
+        "UPDATE media SET canonical_path=$2 WHERE id=$1", media_id, f"audio/{media_id}.m4a"
+    )
+
+    page = await http_client.get(f"/api/v1/threads/{thread_id}")
+    media = page.json()["op"]["media"]
+    assert media == [
+        {
+            "media_kind": "audio",
+            "preview_url": None,
+            "display_url": None,
+            "content_url": f"/media/{public_key}/content",
+            "mime_type": "audio/mp4",
+            "is_animation": False,
+            "duration_seconds": 12,
+        }
+    ]
+    content = await http_client.get(media[0]["content_url"])
+    head = await http_client.head(media[0]["content_url"])
+    assert content.status_code == 200
+    assert content.headers["content-type"] == "audio/mp4"
+    assert content.headers["x-accel-redirect"] == f"/_imageboard_media/audio/{media_id}.m4a"
+    assert head.status_code == 200
+    assert "quarantine" not in str(content.headers)
+    assert (await http_client.get(f"/media/{public_key}/display")).status_code == 404
+
+    deleted = await http_client.request(
+        "DELETE", f"/api/v1/threads/{thread_id}", json={"deletion_password": "audio-delete"}
+    )
+    assert deleted.status_code == 204
+    assert (await http_client.get(media[0]["content_url"])).status_code == 404
+
+
+@pytest.mark.anyio
+async def test_real_ffmpeg_audio_upload_worker_attach_and_delivery(
+    http_client: AsyncClient, tmp_path: Path
+) -> None:
+    """mp3 m4a и ogg/opus проходят реальный upload worker и protected delivery lifecycle"""
+
+    board_slug = f"audio-e2e-{uuid.uuid4().hex[:8]}"
+    csrf = await login(http_client, "owner", "owner-password")
+    board = await http_client.post(
+        "/api/v1/admin/boards", headers=csrf, json={"slug": board_slug, "title": "Audio E2E"}
+    )
+    assert board.status_code == 200
+    assert (await http_client.post("/api/v1/auth/logout", headers=csrf)).status_code == 204
+    claim = await http_client.post(f"/api/v1/boards/{board_slug}/posting-claims")
+    assert claim.status_code == 201
+    token = claim.json()["token"]
+
+    uploaded_ids: list[int] = []
+    for media_type, filename, client_mime in [
+        ("mp3", "not-trusted.bin", "application/octet-stream"),
+        ("m4a", "wrong-extension.mp3", "audio/mpeg"),
+        ("opus", "not-trusted.jpg", "text/plain"),
+    ]:
+        response = await http_client.post(
+            f"/api/v1/boards/{board_slug}/media",
+            data={"posting_claim_token": token},
+            files={"file": (filename, make_audio_file(tmp_path, media_type), client_mime)},
+        )
+        assert response.status_code == 201
+        uploaded_ids.append(response.json()["id"])
+
+    repository = MediaRepository(app.state.postgres_pool)
+    storage = MediaStorage(app.state.media_storage_root)
+    for media_id, expected in zip(
+        uploaded_ids,
+        [("m4a", "aac"), ("m4a", "aac"), ("ogg", "opus")],
+        strict=True,
+    ):
+        queued = await repository.get_by_id(media_id)
+        assert queued is not None
+        quarantine_path = storage.resolve(queued.path)
+        assert quarantine_path.is_file()
+        claimed = await repository.claim_by_id(
+            media_id, max_attempts=MAX_PROCESSING_ATTEMPTS, lease_duration=PROCESSING_LEASE
+        )
+        assert claimed is not None
+        await process_job(repository, media_id, storage)
+        ready = await repository.get_by_id(media_id)
+        assert ready is not None and ready.processing_state.value == "ready"
+        assert ready.canonical_path is not None
+        actual_containers, actual_codec = probe_audio(storage.resolve(ready.canonical_path))
+        assert expected[0] in actual_containers
+        assert actual_codec == expected[1]
+        assert not quarantine_path.exists()
+
+    created = await http_client.post(
+        f"/api/v1/boards/{board_slug}/threads",
+        json={
+            "body": "real audio",
+            "deletion_password": "audio-e2e-delete",
+            "posting_claim_token": token,
+            "media_ids": uploaded_ids,
+        },
+    )
+    assert created.status_code == 201
+    thread_id = created.json()["thread"]["id"]
+    media = created.json()["posts"][0]["media"]
+    assert [item["media_kind"] for item in media] == ["audio", "audio", "voice"]
+    assert all(item["content_url"] is not None for item in media)
+    assert all(item["preview_url"] is None and item["display_url"] is None for item in media)
+    ranged = await http_client.get(media[0]["content_url"], headers={"range": "bytes=0-4"})
+    assert ranged.status_code == 200
+    assert ranged.headers["x-accel-redirect"].startswith("/_imageboard_media/audio/")
+    assert "quarantine" not in str(ranged.headers)
+
+    deleted = await http_client.request(
+        "DELETE", f"/api/v1/threads/{thread_id}", json={"deletion_password": "audio-e2e-delete"}
+    )
+    assert deleted.status_code == 204
+    assert (await http_client.get(media[0]["content_url"])).status_code == 404
 
 
 @pytest.mark.anyio

@@ -48,7 +48,12 @@ def _looks_like_known_non_image(path: Path) -> bool:
         header = source.read(16)
     return (
         (len(header) >= 8 and header[4:8] == b"ftyp")
-        or header.startswith((b"OggS", b"ID3", b"PK\x03\x04", b"Rar!", b"7z\xbc\xaf'\x1c"))
+        or (header.startswith(b"RIFF") and header[8:12] == b"WAVE")
+        or header.startswith(b"fLaC")
+        or header.startswith(b"\x1aE\xdf\xa3")
+        or header.startswith(
+            (b"OggS", b"ID3", b"PK\x03\x04", b"Rar!", b"7z\xbc\xaf'\x1c", b"\x1f\x8b")
+        )
         or header.startswith(b"MZ")
     )
 

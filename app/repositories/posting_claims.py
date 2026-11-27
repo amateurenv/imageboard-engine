@@ -35,6 +35,7 @@ class ClaimMedia:
     size: int
     mime_type: str
     is_animation: bool
+    media_kind: str
 
 
 def _claim(row: Record) -> PostingClaim:
@@ -142,14 +143,16 @@ class PostingClaimsRepository:
         self, connection: Connection, claim_id: int, board_id: int, media_ids: list[int]
     ) -> list[ClaimMedia]:
         rows = await connection.fetch(
-            """SELECT id,size,mime_type,is_animation FROM media
+            """SELECT id,size,mime_type,is_animation,media_kind FROM media
                WHERE id = ANY($1::bigint[]) AND posting_claim_id=$2 AND board_id=$3
                  AND post_id IS NULL AND processing_state='ready'
                ORDER BY array_position($1::bigint[], id) FOR UPDATE""",
             media_ids, claim_id, board_id,
         )
         return [
-            ClaimMedia(row["id"], row["size"], row["mime_type"], row["is_animation"])
+            ClaimMedia(
+                row["id"], row["size"], row["mime_type"], row["is_animation"], row["media_kind"]
+            )
             for row in rows
         ]
 
@@ -169,9 +172,13 @@ class PostingClaimsRepository:
                    SET post_id=$2,
                        attachment_position=$3,
                        public_key=CASE
-                           WHEN media.mime_type IN ('image/jpeg', 'image/png', 'image/webp', 'image/gif')
+                           WHEN media.media_kind='image'
                             AND media.display_path IS NOT NULL
                             AND media.preview_path IS NOT NULL
+                           THEN $5
+                           WHEN media.media_kind IN ('audio', 'voice')
+                            AND media.canonical_path IS NOT NULL
+                            AND media.canonical_mime_type IS NOT NULL
                            THEN $5
                            ELSE NULL
                        END

@@ -42,14 +42,20 @@ Redis не переносится как база данных. В движке 
    .venv/bin/python -m scripts.cleanup_media_files
    ```
 
-   Image upload принимает JPEG, PNG, static WebP, GIF и animated WebP. Файлы хранятся в закрытом
+   Image upload принимает JPEG, PNG, static WebP, GIF, animated WebP, MP3, M4A/AAC и OGG/Opus voice. Файлы хранятся в закрытом
    quarantine до worker. GIF и animated WebP ограничены числом кадров, длительностью,
    размерами и decoded-pixel budget, затем получают animated WebP display и статичный preview.
    Ready preview/display выдаются только через FastAPI
    check и internal Nginx template - оригиналы и quarantine никогда не раздаются.
    На новом компьютере отдельно укажи абсолютный `MEDIA_STORAGE_ROOT` в Nginx
-   template и не публикуй его через public alias. Видео, stickers, Telegram media и
-   антивирус ещё не настроены
+   template и не публикуй его через public alias. Видео, video note, stickers,
+   TGS/WebM, Telegram media, WebSocket, публичный frontend и антивирус ещё не настроены
+
+   Для audio/voice дополнительно установи FFmpeg с `ffprobe`: это обязательные
+   зависимости production и CI. Upload принимает
+   MP3/M4A/AAC как audio и только OGG/Opus как voice, worker выдаёт соответственно
+   M4A/AAC и OGG/Opus canonical derivative. Audio ограничен 30 минутами, двумя
+   каналами и 48 kHz; voice - 10 минутами, mono и 48 kHz. Оригиналы не раздаются.
 
 10. Если используется upload, отдельно запусти worker с тем же `.env`:
 

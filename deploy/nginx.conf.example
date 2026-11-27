@@ -21,6 +21,31 @@ server {
         limit_except GET HEAD { deny all; }
     }
 
+    # audio derivative также доступен только после FastAPI проверки opaque key
+    location ~ ^/_imageboard_media/audio/([1-9][0-9]*)\.m4a$ {
+        internal;
+        alias /srv/imageboard-media/audio/$1.m4a;
+        autoindex off;
+        default_type audio/mp4;
+        add_header Content-Disposition "inline" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        add_header Accept-Ranges "bytes" always;
+        limit_except GET HEAD { deny all; }
+    }
+
+    location ~ ^/_imageboard_media/voice/([1-9][0-9]*)\.ogg$ {
+        internal;
+        alias /srv/imageboard-media/voice/$1.ogg;
+        autoindex off;
+        default_type audio/ogg;
+        add_header Content-Disposition "inline" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        add_header Accept-Ranges "bytes" always;
+        limit_except GET HEAD { deny all; }
+    }
+
     # любой другой внутренний путь, включая quarantine и originals, остаётся недоступным
     location /_imageboard_media/ {
         internal;

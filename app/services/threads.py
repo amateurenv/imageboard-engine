@@ -359,9 +359,21 @@ class ThreadsService:
             thread_canonical_url=thread_url,
             media=[
                 PublicMediaUrls(
-                    preview_url=f"/media/{item.public_key}/preview",
-                    display_url=f"/media/{item.public_key}/display",
+                    media_kind=item.media_kind,
+                    preview_url=(
+                        f"/media/{item.public_key}/preview" if item.media_kind == "image" else None
+                    ),
+                    display_url=(
+                        f"/media/{item.public_key}/display" if item.media_kind == "image" else None
+                    ),
+                    content_url=(
+                        f"/media/{item.public_key}/content"
+                        if item.media_kind in {"audio", "voice"}
+                        else None
+                    ),
+                    mime_type=item.canonical_mime_type or "image/webp",
                     is_animation=item.is_animation,
+                    duration_seconds=item.duration_seconds,
                 )
                 for item in (post.media if media is None else media)
             ],

@@ -22,14 +22,18 @@ class MediaUploadResponse(BaseModel):
     size: int = Field(ge=0)
     mime_type: str
     processing_state: str
+    media_kind: str
     created_at: datetime
 
 
 class PublicMediaUrls(BaseModel):
     """готовые ссылки на derivative без внутреннего id или пути storage"""
 
-    preview_url: str
-    display_url: str
+    media_kind: str = "image"
+    preview_url: str | None = None
+    display_url: str | None = None
+    content_url: str | None = None
     mime_type: str = "image/webp"
     # true означает animated WebP display, preview всегда остаётся статичным WebP
     is_animation: bool = False
+    duration_seconds: int | None = None

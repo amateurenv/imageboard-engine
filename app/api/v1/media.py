@@ -68,5 +68,6 @@ async def upload_image(
         size=media.size,
         mime_type=media.mime_type,
         processing_state=media.processing_state.value,
+        media_kind=media.media_kind,
         created_at=media.created_at,
     )

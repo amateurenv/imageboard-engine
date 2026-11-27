@@ -68,9 +68,9 @@ def test_more_than_ten_attachments_is_rejected() -> None:
     assert error.value.http_status == 422
 
 
-@pytest.mark.parametrize("media_type", ["document", "audio", "voice", "application/zip"])
+@pytest.mark.parametrize("media_type", ["document", "application/zip"])
 def test_unsupported_attachment_type_is_rejected(media_type: str) -> None:
-    """документы, звук и произвольные файлы не становятся вложениями"""
+    """документы и произвольные файлы не становятся вложениями"""
 
     with pytest.raises(MediaPolicyError) as error:
         default_policy().validate([MediaAttachment(media_type, 1)])

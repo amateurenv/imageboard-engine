@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     # корень закрытого media storage, не подключать к static или reverse proxy на этом этапе
     media_storage_root: Path = Path("media")
 
+    # имена бинарников задаются оператором, но никогда не становятся частью shell-команды
+    ffmpeg_bin: str = "ffmpeg"
+    ffprobe_bin: str = "ffprobe"
+
     @model_validator(mode="after")
     def reject_debug_in_production(self) -> Self:
         """запретить подробные ошибки в production"""

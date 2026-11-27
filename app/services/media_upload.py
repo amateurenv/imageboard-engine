@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 from asyncpg import Connection, Pool
@@ -13,6 +14,7 @@ from app.core.site_settings import SiteSettings
 from app.repositories.media import MediaRecord, MediaRepository
 from app.repositories.posting_claims import ClaimBoard, PostingClaim, PostingClaimsRepository
 from app.repositories.users import UserRecord
+from app.services.audio_processing import AudioInspection, FFmpegMediaProcessor
 from app.services.image_validation import validate_image
 from app.services.media_policy import (
     MediaAttachment,
@@ -34,6 +36,18 @@ UPLOAD_CHUNK_SIZE = 1024 * 1024
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True, slots=True)
+class UploadInspection:
+    """общий безопасный результат image decoder или ffprobe без имени клиента"""
+
+    mime_type: str
+    media_type: MediaType
+    is_animation: bool = False
+    duration_seconds: int | None = None
+    channels: int | None = None
+    sample_rate: int | None = None
+
+
 class MediaUploadService:
     """сохранить image в quarantine и создать только queued запись media"""
 
@@ -43,11 +57,13 @@ class MediaUploadService:
         redis_client: Redis,
         settings: SiteSettings,
         storage_root: Path,
+        audio_processor: FFmpegMediaProcessor | None = None,
     ) -> None:
         self._pool = pool
         self._redis = redis_client
         self._settings = settings
         self._storage = MediaStorage(storage_root)
+        self._audio_processor = audio_processor or FFmpegMediaProcessor()
         self._claims = PostingClaimsRepository(pool)
         self._media = MediaRepository(pool)
 
@@ -75,7 +91,7 @@ class MediaUploadService:
             # имя не связано с filename клиента и никогда не возвращается api
             path = self._storage.new_quarantine_path(".image")
             size = await self._stream_to_quarantine(file, path, policy)
-            image = await asyncio.to_thread(validate_image, self._storage.resolve(path))
+            inspected = await asyncio.to_thread(self._inspect, self._storage.resolve(path))
 
             async with self._pool.acquire() as connection:
                 async with connection.transaction():
@@ -95,7 +111,7 @@ class MediaUploadService:
                     attachments = [
                         MediaAttachment(MediaType.PHOTO, item) for item in existing_sizes
                     ]
-                    attachments.append(MediaAttachment(image.media_type, size))
+                    attachments.append(MediaAttachment(inspected.media_type, size))
                     current_policy.validate(attachments)
                     if len(attachments) > claim.max_attachments:
                         raise MediaPolicyError(
@@ -107,10 +123,18 @@ class MediaUploadService:
                         connection,
                         path=path,
                         size=size,
-                        mime_type=image.mime_type,
-                    is_animation=image.is_animation,
+                        mime_type=inspected.mime_type,
+                        is_animation=inspected.is_animation,
                         board_id=locked_board.id,
                         posting_claim_id=claim.id,
+                        media_kind=(
+                            "image"
+                            if inspected.media_type in {MediaType.PHOTO, MediaType.ANIMATION}
+                            else inspected.media_type.value
+                        ),
+                        duration_seconds=inspected.duration_seconds,
+                        channels=inspected.channels,
+                        sample_rate=inspected.sample_rate,
                     )
             try:
                 # postgres хранит queued источник истины, redis только сокращает ожидание worker
@@ -127,6 +151,30 @@ class MediaUploadService:
             raise
         finally:
             await file.close()
+
+    def _inspect(self, path: Path) -> UploadInspection:
+        """сначала доверять image decoder, затем ffprobe только для узнаваемого audio container"""
+
+        try:
+            image = validate_image(path)
+        except MediaPolicyError as image_error:
+            if not self._audio_processor.looks_like_audio_candidate(path):
+                raise image_error
+            audio = self._audio_processor.inspect(path)
+            return self._audio_inspection(audio)
+        return UploadInspection(image.mime_type, image.media_type, image.is_animation)
+
+    @staticmethod
+    def _audio_inspection(audio: AudioInspection) -> UploadInspection:
+        """не переносить из ffprobe ничего кроме разрешённых технических чисел"""
+
+        return UploadInspection(
+            audio.source_mime_type,
+            audio.media_type,
+            duration_seconds=audio.duration_seconds,
+            channels=audio.channels,
+            sample_rate=audio.sample_rate,
+        )
 
     async def _stream_to_quarantine(
         self, file: UploadFile, relative_path: str, policy: MediaPolicy

@@ -89,6 +89,7 @@ async def test_multipart_upload_returns_no_internal_storage_path() -> None:
         "size": 123,
         "mime_type": "image/jpeg",
         "processing_state": "queued",
+        "media_kind": "image",
         "created_at": "2026-01-01T00:00:00Z",
     }
 

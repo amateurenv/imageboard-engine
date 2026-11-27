@@ -57,10 +57,22 @@ class MediaDeliveryService:
 
         if PUBLIC_KEY_PATTERN.fullmatch(public_key) is None:
             return None
-        if asset_kind not in {"preview", "display"}:
+        if asset_kind not in {"preview", "display", "content"}:
             return None
         media = await self._repository.get_deliverable(public_key)
         if media is None or not self._access.allows(media, actor):
+            return None
+        if asset_kind == "content":
+            if media.media_kind not in {"audio", "voice"} or media.canonical_path is None:
+                return None
+            extension = "m4a" if media.media_kind == "audio" else "ogg"
+            if media.canonical_path != f"{media.media_kind}/{media.id}.{extension}":
+                return None
+            return MediaDelivery(
+                content_type=media.canonical_mime_type or "application/octet-stream",
+                accel_path=f"{INTERNAL_ACCEL_PREFIX}/{media.canonical_path}",
+            )
+        if media.media_kind != "image":
             return None
         relative_path = media.preview_path if asset_kind == "preview" else media.display_path
         directory = "previews" if asset_kind == "preview" else "display"

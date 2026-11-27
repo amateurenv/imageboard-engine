@@ -11,6 +11,7 @@ from app.core.config import get_settings
 from app.core.database import close_postgres_pool, create_postgres_pool
 from app.core.redis import close_redis_client, create_redis_client
 from app.repositories.media import MediaRepository
+from app.services.audio_processing import FFmpegMediaProcessor
 from app.services.image_validation import validate_image
 from app.services.media_scanner import MediaScanner, NoopMediaScanner
 from app.services.media_storage import MediaStorage
@@ -119,6 +120,7 @@ async def process_job(
     media_id: int,
     storage: MediaStorage,
     scanner: MediaScanner | None = None,
+    audio_processor: FFmpegMediaProcessor | None = None,
 ) -> None:
     """создать производные файлы и пометить запись ready только в самом конце"""
 
@@ -128,6 +130,34 @@ async def process_job(
     source_path = storage.resolve(media.path)
     # production scanner подключат здесь - до derivative и перевода media в ready
     await asyncio.to_thread((scanner or NoopMediaScanner()).scan, source_path)
+    if media.media_kind in {"audio", "voice"}:
+        processor = audio_processor or FFmpegMediaProcessor(
+            get_settings().ffmpeg_bin, get_settings().ffprobe_bin
+        )
+        inspected = await asyncio.to_thread(processor.inspect, source_path)
+        if inspected.media_type.value != media.media_kind:
+            raise ValueError("media kind does not match its validated source")
+        canonical_path: str | None = None
+        try:
+            canonical_path, canonical_mime_type = await asyncio.to_thread(
+                processor.transcode, source_path, storage, media.id, inspected
+            )
+            # transcode возвращает путь только после atomic replace в storage
+            assert canonical_path is not None
+            storage.delete_file(media.path)
+            ready = await repository.mark_audio_ready(
+                media.id,
+                canonical_path=canonical_path,
+                canonical_mime_type=canonical_mime_type,
+            )
+            if ready is None:
+                raise RuntimeError("media processing lease was lost")
+        except Exception:
+            if canonical_path is not None:
+                storage.delete_file(canonical_path)
+            raise
+        return
+
     # проверка повторяется в worker, потому что очередь может пережить обновление процесса
     validated = await asyncio.to_thread(validate_image, source_path)
     if validated.is_animation != media.is_animation:
