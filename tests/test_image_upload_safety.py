@@ -10,6 +10,7 @@ from PIL import Image
 from redis.asyncio import Redis
 
 from app.core.site_settings import MediaSettings, SiteSettings
+from app.services import image_validation
 from app.services.image_validation import validate_image
 from app.services.media_policy import MediaPolicy, MediaPolicyCode, MediaPolicyError
 from app.services.media_storage import MediaStorage, MediaStorageError
@@ -26,9 +27,36 @@ def make_image(image_format: str, size: tuple[int, int] = (8, 8)) -> bytes:
     return output.getvalue()
 
 
+def make_animation(
+    image_format: str, *, frames: int = 2, duration: int = 100, size: tuple[int, int] = (8, 8)
+) -> bytes:
+    """создать короткую анимацию только для decoder и worker тестов"""
+
+    images = [
+        Image.new("RGB", size, (255 if index % 2 else 0, 0, 255 if index % 2 == 0 else 0))
+        for index in range(frames)
+    ]
+    output = BytesIO()
+    images[0].save(
+        output,
+        image_format,
+        save_all=True,
+        append_images=images[1:],
+        duration=duration,
+        loop=0,
+        optimize=False,
+    )
+    return output.getvalue()
+
+
 @pytest.mark.parametrize(
     ("image_format", "mime_type"),
-    [("JPEG", "image/jpeg"), ("PNG", "image/png"), ("WEBP", "image/webp")],
+    [
+        ("JPEG", "image/jpeg"),
+        ("PNG", "image/png"),
+        ("WEBP", "image/webp"),
+        ("GIF", "image/gif"),
+    ],
 )
 def test_only_expected_images_pass_content_validation(
     tmp_path: Path, image_format: str, mime_type: str
@@ -41,14 +69,38 @@ def test_only_expected_images_pass_content_validation(
     assert validate_image(path).mime_type == mime_type
 
 
-def test_gif_and_broken_or_polyglot_image_are_rejected(tmp_path: Path) -> None:
-    """unsupported или appended content не доходит до worker"""
+@pytest.mark.parametrize("image_format", ["GIF", "WEBP"])
+def test_animated_gif_and_webp_are_detected_from_content(
+    tmp_path: Path, image_format: str
+) -> None:
+    """анимация определяется decoder, а не расширением или multipart MIME"""
+
+    path = tmp_path / "pretend-static.jpg"
+    path.write_bytes(make_animation(image_format))
+
+    validated = validate_image(path)
+
+    assert validated.is_animation is True
+    assert validated.media_type.value == "animation"
+
+
+def test_static_webp_is_not_marked_as_animation(tmp_path: Path) -> None:
+    """однокадровый WebP остаётся обычным photo для клиента и policy"""
+
+    path = tmp_path / "still.webp"
+    path.write_bytes(make_image("WEBP"))
+
+    assert validate_image(path).is_animation is False
+
+
+def test_broken_or_polyglot_image_is_rejected(tmp_path: Path) -> None:
+    """повреждённый или appended container не доходит до worker"""
 
     gif = tmp_path / "image.gif"
-    gif.write_bytes(make_image("GIF"))
-    with pytest.raises(MediaPolicyError) as unsupported:
+    gif.write_bytes(make_animation("GIF")[:-1])
+    with pytest.raises(MediaPolicyError) as invalid_gif:
         validate_image(gif)
-    assert unsupported.value.code is MediaPolicyCode.UNSUPPORTED_MEDIA_TYPE
+    assert invalid_gif.value.code is MediaPolicyCode.INVALID_MEDIA
 
     polyglot = tmp_path / "image.png"
     polyglot.write_bytes(make_image("PNG") + b"not-an-image-payload")
@@ -64,6 +116,35 @@ def test_dimension_limit_rejects_small_file_with_excessive_width(tmp_path: Path)
     path.write_bytes(make_image("PNG", (12_001, 1)))
     with pytest.raises(MediaPolicyError) as error:
         validate_image(path)
+    assert error.value.code is MediaPolicyCode.INVALID_MEDIA
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value", "animation"),
+    [
+        ("MAX_ANIMATION_FRAME_SIDE", 7, {"size": (8, 8)}),
+        ("MAX_ANIMATION_FRAME_PIXELS", 63, {"size": (8, 8)}),
+        ("MAX_ANIMATION_FRAMES", 1, {"frames": 2}),
+        ("MAX_ANIMATION_DURATION_MS", 100, {"duration": 101}),
+        ("MAX_ANIMATION_DECODED_PIXELS", 100, {"frames": 2, "size": (8, 8)}),
+    ],
+)
+def test_animation_resource_limits_are_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attribute: str,
+    value: int,
+    animation: dict[str, object],
+) -> None:
+    """каждый animation budget возвращает единый доменный invalid_media"""
+
+    path = tmp_path / "large.gif"
+    path.write_bytes(make_animation("GIF", **animation))
+    monkeypatch.setattr(image_validation, attribute, value)
+
+    with pytest.raises(MediaPolicyError) as error:
+        validate_image(path)
+
     assert error.value.code is MediaPolicyCode.INVALID_MEDIA
 
 
@@ -109,6 +190,27 @@ def test_worker_derivatives_stay_inside_storage_and_drop_metadata(tmp_path: Path
     with Image.open(storage.resolve(display_path)) as display:
         assert display.format == "WEBP"
         assert not display.getexif()
+
+
+@pytest.mark.parametrize("image_format", ["GIF", "WEBP"])
+def test_worker_reencodes_animation_to_animated_display_and_static_preview(
+    tmp_path: Path, image_format: str
+) -> None:
+    """animation display остаётся animated WebP, а preview берёт только первый кадр"""
+
+    storage = MediaStorage(tmp_path)
+    source = storage.resolve(f"quarantine/source.{image_format.lower()}")
+    source.parent.mkdir(mode=0o700, parents=True)
+    source.write_bytes(make_animation(image_format))
+
+    display_path, preview_path = make_derivatives(str(source), storage, 43, True)
+
+    with Image.open(storage.resolve(display_path)) as display:
+        assert display.format == "WEBP"
+        assert display.n_frames == 2
+    with Image.open(storage.resolve(preview_path)) as preview:
+        assert preview.format == "WEBP"
+        assert preview.n_frames == 1
 
 
 def test_worker_removes_partial_derivatives_after_failure(

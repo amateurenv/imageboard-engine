@@ -139,7 +139,7 @@ ON CONFLICT DO NOTHING
 """
 
 LIST_PUBLIC_MEDIA_SQL = """
-SELECT media.post_id, media.public_key, media.mime_type
+SELECT media.post_id, media.public_key, media.mime_type, media.is_animation
 FROM media
 JOIN posts AS post ON post.id=media.post_id
 JOIN threads AS thread ON thread.id=post.thread_id
@@ -189,6 +189,7 @@ class PublicMediaRecord:
 
     public_key: str
     mime_type: str
+    is_animation: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -399,7 +400,9 @@ class ThreadsRepository:
         grouped: dict[int, list[PublicMediaRecord]] = {}
         for row in rows:
             grouped.setdefault(row["post_id"], []).append(
-                PublicMediaRecord(row["public_key"], row["mime_type"])
+                PublicMediaRecord(
+                    row["public_key"], row["mime_type"], row["is_animation"]
+                )
             )
         return {post_id: tuple(media) for post_id, media in grouped.items()}
 

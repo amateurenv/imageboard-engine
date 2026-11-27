@@ -10,4 +10,6 @@ def detect_media_type(header: bytes) -> tuple[str, str] | None:
         return "image/png", ".png"
     if header.startswith(b"RIFF") and header[8:12] == b"WEBP":
         return "image/webp", ".webp"
+    if header.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif", ".gif"
     return None

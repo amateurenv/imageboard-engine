@@ -82,5 +82,7 @@ def test_nginx_template_keeps_derivatives_internal() -> None:
     assert "internal;" in config
     assert "autoindex off;" in config
     assert "display|previews" in config
+    assert "default_type image/webp;" in config
+    assert 'X-Content-Type-Options "nosniff"' in config
     assert "quarantine" in config
     assert "location /media/" not in config

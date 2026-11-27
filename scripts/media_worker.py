@@ -42,26 +42,71 @@ def _save_webp(image: Image.Image, storage: MediaStorage, relative_path: str) ->
         raise
 
 
-def make_derivatives(source_path: str, storage: MediaStorage, media_id: int) -> tuple[str, str]:
-    """декодировать image и создать display с preview без EXIF и ICC metadata"""
+def _normalized_static_frame(source: Image.Image) -> Image.Image:
+    """скопировать один кадр без EXIF, ICC и palette metadata оригинала"""
+
+    normalized = ImageOps.exif_transpose(source).copy()
+    if normalized.mode not in {"RGB", "RGBA"}:
+        return normalized.convert("RGBA" if "transparency" in source.info else "RGB")
+    return normalized
+
+
+def _save_animated_webp(
+    source: Image.Image, storage: MediaStorage, relative_path: str
+) -> None:
+    """перекодировать animation по одному кадру без загрузки всех кадров в память"""
+
+    temporary_path = storage.temporary_path(relative_path)
+    try:
+        frame_count = getattr(source, "n_frames", 1)
+        durations: list[int] = []
+        for frame_index in range(frame_count):
+            source.seek(frame_index)
+            duration = source.info.get("duration", 0)
+            if not isinstance(duration, int) or duration < 0:
+                raise ValueError("animation frame duration is invalid")
+            durations.append(duration)
+        source.seek(0)
+        # Pillow's WebP encoder iterates source.n_frames itself, so append_images is not needed
+        source.save(
+            temporary_path,
+            "WEBP",
+            save_all=True,
+            duration=durations,
+            loop=source.info.get("loop", 0),
+            quality=85,
+            method=6,
+        )
+        os.chmod(temporary_path, 0o600)
+        storage.replace_from_temporary(temporary_path, relative_path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def make_derivatives(
+    source_path: str, storage: MediaStorage, media_id: int, is_animation: bool = False
+) -> tuple[str, str]:
+    """создать server-side display и статичный preview без metadata оригинала"""
 
     display_path = f"display/{media_id}.webp"
     preview_path = f"previews/{media_id}.webp"
     try:
         with Image.open(source_path) as source:
-            source.load()
+            actual_animation = getattr(source, "n_frames", 1) > 1
+            if actual_animation != is_animation:
+                raise ValueError("validated animation state changed before processing")
+            source.seek(0)
             # новый объект не переносит EXIF, ICC и произвольные поля из исходного файла
-            normalized = ImageOps.exif_transpose(source).copy()
-            if normalized.mode not in {"RGB", "RGBA"}:
-                normalized = normalized.convert("RGBA" if "transparency" in source.info else "RGB")
-
-            display = normalized.copy()
-            display.thumbnail(DISPLAY_SIZE)
-            _save_webp(display, storage, display_path)
-
-            preview = normalized.copy()
+            preview = _normalized_static_frame(source)
             preview.thumbnail(PREVIEW_SIZE)
             _save_webp(preview, storage, preview_path)
+            if actual_animation:
+                _save_animated_webp(source, storage, display_path)
+            else:
+                display = _normalized_static_frame(source)
+                display.thumbnail(DISPLAY_SIZE)
+                _save_webp(display, storage, display_path)
     except Exception:
         storage.delete_file(display_path)
         storage.delete_file(preview_path)
@@ -84,9 +129,11 @@ async def process_job(
     # production scanner подключат здесь - до derivative и перевода media в ready
     await asyncio.to_thread((scanner or NoopMediaScanner()).scan, source_path)
     # проверка повторяется в worker, потому что очередь может пережить обновление процесса
-    await asyncio.to_thread(validate_image, source_path)
+    validated = await asyncio.to_thread(validate_image, source_path)
+    if validated.is_animation != media.is_animation:
+        raise ValueError("media animation state does not match its validated source")
     display_path, preview_path = await asyncio.to_thread(
-        make_derivatives, str(source_path), storage, media.id
+        make_derivatives, str(source_path), storage, media.id, media.is_animation
     )
     try:
         # оригинал из quarantine не нужен после успешного server-side re-encode

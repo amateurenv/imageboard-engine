@@ -7,6 +7,7 @@ def test_media_type_comes_from_file_signature() -> None:
     """jpeg определяется по байтам, а не по заголовку клиента"""
 
     assert detect_media_type(b"\xff\xd8\xff\xe0" + b"x" * 60) == ("image/jpeg", ".jpg")
+    assert detect_media_type(b"GIF89a" + b"x" * 60) == ("image/gif", ".gif")
 
 
 def test_unknown_signature_is_rejected() -> None:

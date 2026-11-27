@@ -24,6 +24,7 @@ from app.main import app
 from app.repositories.media import MediaRepository
 from app.repositories.posting_claims import PostingClaimsRepository
 from app.repositories.users import UsersRepository
+from app.services.media_policy import MediaPolicyError
 from app.services.media_storage import MediaStorage
 from app.ws.manager import DisabledWebSocketManager
 from scripts.cleanup_media_files import cleanup_media_files
@@ -125,13 +126,39 @@ def image_bytes(image_format: str) -> bytes:
     return result.getvalue()
 
 
-async def upload_ready_image(client: AsyncClient, board_slug: str, token: str) -> int:
-    """загрузить JPEG и вручную завершить worker для HTTP integration сценария"""
+def animated_image_bytes(image_format: str) -> bytes:
+    """создать короткую анимацию для настоящего upload и worker сценария"""
+
+    result = BytesIO()
+    first = Image.new("RGB", (8, 8), "red")
+    second = Image.new("RGB", (8, 8), "blue")
+    first.save(
+        result,
+        image_format,
+        save_all=True,
+        append_images=[second],
+        duration=100,
+        loop=0,
+        optimize=False,
+    )
+    return result.getvalue()
+
+
+async def upload_ready_image(
+    client: AsyncClient,
+    board_slug: str,
+    token: str,
+    *,
+    payload: bytes | None = None,
+    filename: str = "image.jpg",
+    mime_type: str = "image/jpeg",
+) -> int:
+    """загрузить image и вручную завершить worker для HTTP integration сценария"""
 
     uploaded = await client.post(
         f"/api/v1/boards/{board_slug}/media",
         data={"posting_claim_token": token},
-        files={"file": ("image.jpg", image_bytes("JPEG"), "image/jpeg")},
+        files={"file": (filename, image_bytes("JPEG") if payload is None else payload, mime_type)},
     )
     assert uploaded.status_code == 201
     media_id = uploaded.json()["id"]
@@ -653,15 +680,17 @@ async def test_image_upload_quarantine_worker_attach_and_cleanup(http_client: As
     token = claim.json()["token"]
 
     uploads = []
-    for image_format, filename, declared_mime in [
-        ("JPEG", "not-trusted.bin", "text/plain"),
-        ("PNG", "picture.png", "application/octet-stream"),
-        ("WEBP", "picture.webp", "image/webp"),
+    for filename, declared_mime, payload in [
+        ("not-trusted.bin", "text/plain", image_bytes("JPEG")),
+        ("picture.png", "application/octet-stream", image_bytes("PNG")),
+        ("picture.webp", "image/webp", image_bytes("WEBP")),
+        ("animation.jpg", "text/plain", animated_image_bytes("GIF")),
+        ("animation.gif", "application/octet-stream", animated_image_bytes("WEBP")),
     ]:
         response = await http_client.post(
             f"/api/v1/boards/{board_slug}/media",
             data={"posting_claim_token": token},
-            files={"file": (filename, image_bytes(image_format), declared_mime)},
+            files={"file": (filename, payload, declared_mime)},
         )
         assert response.status_code == 201
         assert set(response.json()) == {
@@ -673,7 +702,7 @@ async def test_image_upload_quarantine_worker_attach_and_cleanup(http_client: As
     unsupported = await http_client.post(
         f"/api/v1/boards/{board_slug}/media",
         data={"posting_claim_token": token},
-        files={"file": ("animation.gif", image_bytes("GIF"), "image/gif")},
+        files={"file": ("video.mp4", b"\x00\x00\x00\x18ftypisom", "video/mp4")},
     )
     assert unsupported.status_code == 415
     assert unsupported.json()["detail"]["code"] == "unsupported_media_type"
@@ -716,7 +745,8 @@ async def test_image_upload_quarantine_worker_attach_and_cleanup(http_client: As
     assert created.status_code == 201
     thread_id = created.json()["thread"]["id"]
     post_media = created.json()["posts"][0]["media"]
-    assert len(post_media) == 3
+    assert len(post_media) == 5
+    assert [item["is_animation"] for item in post_media] == [False, False, False, True, True]
     display = await http_client.get(post_media[0]["display_url"])
     preview = await http_client.head(post_media[0]["preview_url"])
     assert display.status_code == 200
@@ -737,6 +767,61 @@ async def test_image_upload_quarantine_worker_attach_and_cleanup(http_client: As
 
 
 @pytest.mark.anyio
+async def test_worker_retries_then_fails_modified_animation_without_derivatives(
+    http_client: AsyncClient,
+) -> None:
+    """повреждённый quarantine не делает partial derivative и остаётся в retry lifecycle"""
+
+    board_slug = f"animation-retry-{uuid.uuid4().hex[:8]}"
+    csrf = await login(http_client, "owner", "owner-password")
+    created_board = await http_client.post(
+        "/api/v1/admin/boards",
+        headers=csrf,
+        json={"slug": board_slug, "title": "Animation retry"},
+    )
+    assert created_board.status_code == 200
+    assert (await http_client.post("/api/v1/auth/logout", headers=csrf)).status_code == 204
+
+    claim = await http_client.post(f"/api/v1/boards/{board_slug}/posting-claims")
+    assert claim.status_code == 201
+    uploaded = await http_client.post(
+        f"/api/v1/boards/{board_slug}/media",
+        data={"posting_claim_token": claim.json()["token"]},
+        files={"file": ("animation.gif", animated_image_bytes("GIF"), "image/gif")},
+    )
+    assert uploaded.status_code == 201
+    media_id = uploaded.json()["id"]
+
+    repository = MediaRepository(app.state.postgres_pool)
+    storage = MediaStorage(app.state.media_storage_root)
+    record = await repository.get_by_id(media_id)
+    assert record is not None
+    storage.resolve(record.path).write_bytes(b"not an image after upload")
+
+    for attempt in range(MAX_PROCESSING_ATTEMPTS):
+        claimed = await repository.claim_by_id(
+            media_id,
+            max_attempts=MAX_PROCESSING_ATTEMPTS,
+            lease_duration=PROCESSING_LEASE,
+        )
+        assert claimed is not None
+        with pytest.raises(MediaPolicyError):
+            await process_job(repository, media_id, storage)
+        result = await repository.fail_processing(
+            media_id,
+            max_attempts=MAX_PROCESSING_ATTEMPTS,
+            error="test decoder failure",
+        )
+        assert result is not None
+        if attempt < MAX_PROCESSING_ATTEMPTS - 1:
+            assert result.processing_state.value == "queued"
+        else:
+            assert result.processing_state.value == "failed"
+        assert not storage.resolve(f"display/{media_id}.webp").exists()
+        assert not storage.resolve(f"previews/{media_id}.webp").exists()
+
+
+@pytest.mark.anyio
 async def test_media_delivery_closes_after_profile_hide_and_delete(
     http_client: AsyncClient,
 ) -> None:
@@ -746,7 +831,14 @@ async def test_media_delivery_closes_after_profile_hide_and_delete(
     csrf = await login(http_client, "alice", "profile-password")
     thread_claim = await http_client.post("/api/v1/boards/alice/posting-claims")
     assert thread_claim.status_code == 201
-    thread_media_id = await upload_ready_image(http_client, "alice", thread_claim.json()["token"])
+    thread_media_id = await upload_ready_image(
+        http_client,
+        "alice",
+        thread_claim.json()["token"],
+        payload=animated_image_bytes("GIF"),
+        filename="thread.gif",
+        mime_type="image/gif",
+    )
     created = await http_client.post(
         "/api/v1/boards/alice/threads",
         json={
@@ -758,6 +850,7 @@ async def test_media_delivery_closes_after_profile_hide_and_delete(
     assert created.status_code == 201
     thread_id = created.json()["thread"]["id"]
     thread_url = created.json()["posts"][0]["media"][0]["display_url"]
+    assert created.json()["posts"][0]["media"][0]["is_animation"] is True
     assert (await http_client.get(thread_url)).status_code == 200
 
     hidden_thread = await http_client.patch(

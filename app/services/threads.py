@@ -361,6 +361,7 @@ class ThreadsService:
                 PublicMediaUrls(
                     preview_url=f"/media/{item.public_key}/preview",
                     display_url=f"/media/{item.public_key}/display",
+                    is_animation=item.is_animation,
                 )
                 for item in (post.media if media is None else media)
             ],

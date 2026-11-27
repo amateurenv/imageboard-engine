@@ -27,7 +27,7 @@
 ## media - ограниченный image upload
 
 `/api/v1/media` остаётся выключенным, но `POST /api/v1/boards/{slug}/media`
-принимает JPEG, PNG и WebP только с действующим posting claim. Файл попадает в
+принимает JPEG, PNG, static WebP, GIF и animated WebP только с действующим posting claim. Файл попадает в
 закрытый quarantine, проверяется по содержимому и после worker получает display
 и preview WebP без metadata.
 
@@ -39,12 +39,18 @@ location. FastAPI не читает файл, quarantine и оригиналы �
 должен заменить путь alias на абсолютный `MEDIA_STORAGE_ROOT`, закрыть права
 storage и проверить Nginx отдельно.
 
+GIF и animated WebP проходят отдельные пределы worker: до 4 096 px по стороне
+кадра, 8 миллионов пикселей на кадр, 300 кадров, 30 секунд и 100 миллионов
+суммарно декодированных пикселей. Display перекодируется в animated WebP, preview
+остаётся статичным WebP. Это серверная защита ресурсов, а не пределы Telegram.
+Обычный байтовый предел - 20 MiB на файл, до 10 вложений и 200 MiB на пост.
+
 До широкого public media запуска обязательно нужны:
 
 - антивирус или отдельный безопасный scanner - он ещё не реализован;
 - квоты диска, метрики, alerting и отдельная безопасная раздача через Nginx;
 - операционные проверки worker, восстановления после файловой ошибки и нагрузки;
-- отдельные решения для GIF, видео, stickers, Telegram media и других форматов.
+- отдельные решения для видео, stickers, Telegram media и других форматов.
 
 `NoopMediaScanner` - только extension point для development. Он не является
 антивирусом. Production scanner должен проверять quarantine-файл до worker

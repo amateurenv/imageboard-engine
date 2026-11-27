@@ -39,8 +39,8 @@
 - owner-модерация profile-досок: pin, lock, hide и delete с moderation log
 - self-delete анонимных и account-публикаций без раскрытия автора
 - posting claims для атомарной привязки готовых media к будущему треду или ответу
-- image-only upload через claim: только JPEG, PNG и WebP в закрытый quarantine
-- worker создаёт безопасные display и preview версии через server-side re-encode
+- image upload через claim: JPEG, PNG, static WebP, GIF и animated WebP в закрытый quarantine
+- worker создаёт безопасный WebP display и статичный WebP preview через server-side re-encode
 - выдача только ready display/preview через FastAPI-проверку и internal Nginx
 - защита от потерянных частичных обновлений досок и тредов
 - ограничение bcrypt-пароля 72 UTF-8 байтами и контролируемый `409` для повторного IP-ban
@@ -53,7 +53,7 @@
 - полноценной админ-панели пока нет: минимальная страница `/admin` управляет
   входом, досками и настройками через существующее API
 - CDN и production Nginx пока не настроены - есть только tracked template
-- GIF, видео, stickers, Telegram media и антивирус ещё не реализованы
+- видео, stickers, Telegram media и антивирус ещё не реализованы
 - WebSocket-события и Telegram-бот не готовы
 - нет production-конфигурации reverse proxy, HTTPS, резервного копирования и мониторинга
 
@@ -206,13 +206,15 @@ POST /api/v1/boards/{slug}/media
 ```
 
 Это `multipart/form-data` с полями `posting_claim_token` и `file`. Он принимает
-только JPEG, PNG и WebP. MIME-type, расширение и исходное имя файла не считаются
+JPEG, PNG, static WebP, GIF и animated WebP. MIME-type, расширение и исходное имя файла не считаются
 доказательством типа. Файл записывается кусками под серверным случайным именем
 в закрытый quarantine, проверяется Pillow по содержимому и остаётся недоступным
 по URL.
 
-Worker повторно проверяет изображение, ограничивает разрешение и число пикселей,
-создаёт display и preview через перекодирование в WebP без EXIF/ICC metadata.
+Worker повторно проверяет изображение, ограничивает разрешение и число пикселей.
+Для GIF и animated WebP он создаёт animated WebP display с порядком кадров и
+duration, а preview всегда делает статичным WebP из первого кадра. Для обычных
+image display и preview также создаются через перекодирование в WebP без EXIF/ICC metadata.
 Исходник из quarantine удаляется только после успешного создания производных
 файлов. Оригинал и quarantine никогда не раздаются.
 
@@ -232,9 +234,12 @@ FastAPI снова проверяет key, `ready`, attach и видимость
 абсолютный `MEDIA_STORAGE_ROOT`, сохранить private permissions и не публиковать
 storage через public `alias`.
 
-Дополнительные пределы первого этапа: до 12 000 пикселей по каждой стороне и
-до 20 миллионов пикселей всего. Это защита decoder от чрезмерно большого image,
-а не замена будущему антивирусу.
+Статичный image ограничен 12 000 px по каждой стороне и 20 миллионами пикселей.
+Для animation действуют серверные anti-resource-abuse пределы: до 4 096 px по
+стороне кадра, 8 миллионов пикселей на кадр, 300 кадров, 30 секунд и 100 миллионов
+суммарно декодированных пикселей. Это защита decoder и worker, а не замена будущему
+антивирусу. Общий байтовый лимит в 20 MiB выбран для совместимости с будущим
+Telegram-ботом, но эти limits не являются лимитами Telegram.
 
 В одной транзакции движок повторно проверяет policy, срок claim, account binding,
 состояние `ready`, доску, лимиты и порядок вложений, затем создаёт пост, привязывает
@@ -250,16 +255,18 @@ media и помечает claim consumed. Один claim нельзя испол
 Документы, архивы и исполняемые файлы не входят в модель движка; поддерживаются
 только разрешённые типы медиа.
 
-Сейчас upload принимает только JPEG, PNG и WebP как `photo`. GIF/animation,
-video, video note, stickers, audio, voice, documents, archives и исполняемые
-файлы отклоняются. Telegram, custom emoji и bot API не подключены.
+Сейчас upload принимает JPEG, PNG, static WebP, GIF и animated WebP. В `media`
+готовая animation помечается `is_animation: true`, поэтому клиент знает, что
+display анимирован, а preview остаётся статичным. Video, video note, stickers,
+audio, voice, documents, archives и исполняемые файлы отклоняются. Telegram,
+custom emoji и bot API не подключены.
 
 Будущие форматы перечислены как roadmap, а не как готовая проверка:
 
 | Тип | Сейчас | Будущее ограничение |
 |---|---:|---|
-| photo JPEG/PNG/WebP | да | до 20 MiB |
-| animation GIF / animated WebP | нет | до 20 MiB |
+| photo JPEG/PNG/static WebP | да | до 20 MiB |
+| animation GIF / animated WebP | да | до 20 MiB и server-side animation limits |
 | video MP4 | нет | до 20 MiB |
 | video note | нет | MPEG-4, до 20 MiB и 60 секунд |
 | music/audio | нет | MP3 или M4A, до 20 MiB в Telegram-compatible mode |

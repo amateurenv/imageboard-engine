@@ -31,3 +31,5 @@ class PublicMediaUrls(BaseModel):
     preview_url: str
     display_url: str
     mime_type: str = "image/webp"
+    # true означает animated WebP display, preview всегда остаётся статичным WebP
+    is_animation: bool = False

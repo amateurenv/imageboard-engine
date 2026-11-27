@@ -138,7 +138,9 @@ class PostingClaimsService:
         media = await self._claims.lock_media(connection, claim.id, board.id, media_ids)
         if len(media) != len(media_ids):
             raise PostingClaimError("posting_claim_media_invalid", 403)
-        self._policy(board).validate([MediaAttachment(self._media_type(item.mime_type), item.size) for item in media])
+        self._policy(board).validate(
+            [MediaAttachment(self._media_type(item.mime_type, item.is_animation), item.size) for item in media]
+        )
         return claim
 
     def _policy(self, board: ClaimBoard) -> MediaPolicy:
@@ -153,8 +155,8 @@ class PostingClaimsService:
         return {media_id: secrets.token_urlsafe(32) for media_id in media_ids}
 
     @staticmethod
-    def _media_type(mime_type: str) -> MediaType:
-        if mime_type.startswith("image/gif"):
+    def _media_type(mime_type: str, is_animation: bool) -> MediaType:
+        if is_animation:
             return MediaType.ANIMATION
         if mime_type.startswith("image/"):
             return MediaType.PHOTO

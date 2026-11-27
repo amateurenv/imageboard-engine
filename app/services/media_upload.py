@@ -108,6 +108,7 @@ class MediaUploadService:
                         path=path,
                         size=size,
                         mime_type=image.mime_type,
+                    is_animation=image.is_animation,
                         board_id=locked_board.id,
                         posting_claim_id=claim.id,
                     )

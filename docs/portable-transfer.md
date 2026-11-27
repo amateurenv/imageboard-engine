@@ -42,12 +42,14 @@ Redis не переносится как база данных. В движке 
    .venv/bin/python -m scripts.cleanup_media_files
    ```
 
-   Image upload принимает только JPEG, PNG и WebP. Файлы хранятся в закрытом
-   quarantine до worker. Ready preview/display выдаются только через FastAPI
+   Image upload принимает JPEG, PNG, static WebP, GIF и animated WebP. Файлы хранятся в закрытом
+   quarantine до worker. GIF и animated WebP ограничены числом кадров, длительностью,
+   размерами и decoded-pixel budget, затем получают animated WebP display и статичный preview.
+   Ready preview/display выдаются только через FastAPI
    check и internal Nginx template - оригиналы и quarantine никогда не раздаются.
    На новом компьютере отдельно укажи абсолютный `MEDIA_STORAGE_ROOT` в Nginx
-   template и не публикуй его через public alias. Telegram media и антивирус
-   ещё не настроены
+   template и не публикуй его через public alias. Видео, stickers, Telegram media и
+   антивирус ещё не настроены
 
 10. Если используется upload, отдельно запусти worker с тем же `.env`:
 

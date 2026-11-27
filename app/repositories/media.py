@@ -11,17 +11,17 @@ from app.services.media_queue import (
 )
 
 CREATE_MEDIA_SQL = """
-INSERT INTO media (path, size, mime_type, board_id, posting_claim_id)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO media (path, size, mime_type, is_animation, board_id, posting_claim_id)
+VALUES ($1, $2, $3, $4, $5, $6)
 RETURNING id, path, size, mime_type, created_at, processing_state,
           processing_attempts, processing_lease_until, last_processing_error
-          , board_id, posting_claim_id, display_path, preview_path
+          , board_id, posting_claim_id, display_path, preview_path, is_animation
 """
 
 GET_BY_ID_SQL = """
 SELECT id, path, size, mime_type, created_at, processing_state,
        processing_attempts, processing_lease_until, last_processing_error,
-       board_id, posting_claim_id, display_path, preview_path
+       board_id, posting_claim_id, display_path, preview_path, is_animation
 FROM media
 WHERE id = $1
 """
@@ -46,7 +46,7 @@ RETURNING candidate.id, candidate.path, candidate.size, candidate.mime_type,
           candidate.created_at, candidate.processing_state,
           candidate.processing_attempts, candidate.processing_lease_until,
           candidate.last_processing_error, candidate.board_id, candidate.posting_claim_id,
-          candidate.display_path, candidate.preview_path
+          candidate.display_path, candidate.preview_path, candidate.is_animation
 """
 
 CLAIM_MEDIA_SQL = """
@@ -59,7 +59,7 @@ WHERE id = $1
   AND processing_attempts < $2
 RETURNING id, path, size, mime_type, created_at, processing_state,
           processing_attempts, processing_lease_until, last_processing_error,
-          board_id, posting_claim_id, display_path, preview_path
+          board_id, posting_claim_id, display_path, preview_path, is_animation
 """
 
 MARK_READY_SQL = """
@@ -72,7 +72,7 @@ SET processing_state = 'ready',
 WHERE id = $1 AND processing_state = 'processing'
 RETURNING id, path, size, mime_type, created_at, processing_state,
           processing_attempts, processing_lease_until, last_processing_error
-          , board_id, posting_claim_id, display_path, preview_path
+          , board_id, posting_claim_id, display_path, preview_path, is_animation
 """
 
 FAIL_PROCESSING_SQL = """
@@ -86,7 +86,7 @@ SET processing_state = CASE
 WHERE id = $1 AND processing_state = 'processing'
 RETURNING id, path, size, mime_type, created_at, processing_state,
           processing_attempts, processing_lease_until, last_processing_error,
-          board_id, posting_claim_id, display_path, preview_path
+          board_id, posting_claim_id, display_path, preview_path, is_animation
 """
 
 RECOVER_EXPIRED_SQL = """
@@ -101,7 +101,7 @@ WHERE processing_state = 'processing'
   AND processing_lease_until <= clock_timestamp()
 RETURNING id, path, size, mime_type, created_at, processing_state,
           processing_attempts, processing_lease_until, last_processing_error,
-          board_id, posting_claim_id, display_path, preview_path
+          board_id, posting_claim_id, display_path, preview_path, is_animation
 """
 
 RETRY_FAILED_SQL = """
@@ -113,7 +113,7 @@ SET processing_state = 'queued',
 WHERE id = $1 AND processing_state = 'failed'
 RETURNING id, path, size, mime_type, created_at, processing_state,
           processing_attempts, processing_lease_until, last_processing_error,
-          board_id, posting_claim_id, display_path, preview_path
+          board_id, posting_claim_id, display_path, preview_path, is_animation
 """
 
 DELETE_MEDIA_SQL = """
@@ -168,6 +168,7 @@ class MediaRecord:
     posting_claim_id: int | None = None
     display_path: str | None = None
     preview_path: str | None = None
+    is_animation: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,6 +197,7 @@ def _to_media_record(row: Record) -> MediaRecord:
         posting_claim_id=row["posting_claim_id"],
         display_path=row["display_path"],
         preview_path=row["preview_path"],
+        is_animation=row["is_animation"],
     )
 
 
@@ -211,13 +213,14 @@ class MediaRepository:
         path: str,
         size: int,
         mime_type: str,
+        is_animation: bool = False,
         board_id: int | None = None,
         posting_claim_id: int | None = None,
     ) -> MediaRecord:
         """сохранить запись о загруженном файле"""
 
         row = await self._postgres_pool.fetchrow(
-            CREATE_MEDIA_SQL, path, size, mime_type, board_id, posting_claim_id
+            CREATE_MEDIA_SQL, path, size, mime_type, is_animation, board_id, posting_claim_id
         )
         if row is None:
             # insert без ошибки всегда возвращает строку
@@ -232,13 +235,14 @@ class MediaRepository:
         path: str,
         size: int,
         mime_type: str,
+        is_animation: bool,
         board_id: int,
         posting_claim_id: int,
     ) -> MediaRecord:
         """создать queued media только рядом с уже заблокированным claim"""
 
         row = await connection.fetchrow(
-            CREATE_MEDIA_SQL, path, size, mime_type, board_id, posting_claim_id
+            CREATE_MEDIA_SQL, path, size, mime_type, is_animation, board_id, posting_claim_id
         )
         if row is None:
             raise RuntimeError("media not created")
