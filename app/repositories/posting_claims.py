@@ -231,7 +231,7 @@ class PostingClaimsRepository:
                             AND media.preview_path IS NOT NULL
                            THEN $5
                            WHEN media.media_kind='sticker'
-                            AND media.display_path IS NOT NULL
+                            AND (media.display_path IS NOT NULL OR media.preview_path IS NOT NULL)
                            THEN $5
                            WHEN media.media_kind IN ('audio', 'voice')
                             AND media.canonical_path IS NOT NULL

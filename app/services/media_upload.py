@@ -37,6 +37,7 @@ from app.services.posting_policy import (
     check_posting_permission,
 )
 from app.services.sticker_processing import STICKER_MIME, decode_sticker
+from app.services.tgs_processing import TGS_MIME, canonicalize_tgs
 from app.services.video_processing import VIDEO_MIME, VideoProcessor, looks_like_mp4_video
 
 # потоковая запись ограничивает память одного запроса даже для заявленного большого файла
@@ -188,10 +189,16 @@ class MediaUploadService:
 
         if thread_id is None:
             raise StickerCannotStartThread()
-        image = await asyncio.to_thread(decode_sticker, data)
-        image.close()
+        is_animation = data.startswith(b"\x1f\x8b")
+        if is_animation:
+            await asyncio.to_thread(canonicalize_tgs, data)
+        else:
+            image = await asyncio.to_thread(decode_sticker, data)
+            image.close()
         token = secrets.token_urlsafe(32)
-        staging = asyncio.create_task(self._store_sticker(thread_id, actor, token, data))
+        staging = asyncio.create_task(self._store_sticker(
+            thread_id, actor, token, data, is_animation=is_animation,
+        ))
         try:
             media = await asyncio.shield(staging)
         except asyncio.CancelledError:
@@ -202,7 +209,7 @@ class MediaUploadService:
         return token, media
 
     async def _store_sticker(
-        self, thread_id: int, actor: UserRecord, token: str, data: bytes,
+        self, thread_id: int, actor: UserRecord, token: str, data: bytes, *, is_animation: bool,
     ) -> MediaRecord:
         """сохранить закрытый claim и задачу обработки с общим commit"""
 
@@ -226,9 +233,10 @@ class MediaUploadService:
                     with open(descriptor, "wb", closefd=True) as target:
                         target.write(data)
                     media = await self._media.create_in_transaction(
-                        connection, path=path, size=len(data), mime_type=STICKER_MIME,
+                        connection, path=path, size=len(data),
+                        mime_type=TGS_MIME if is_animation else STICKER_MIME,
                         board_id=board.id, posting_claim_id=claim_id,
-                        is_animation=False, media_kind=MediaType.STICKER.value,
+                        is_animation=is_animation, media_kind=MediaType.STICKER.value,
                     )
         except Exception:
             if path is not None:

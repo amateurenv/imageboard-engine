@@ -363,15 +363,19 @@ class ThreadsService:
                     preview_url=(
                         f"/media/{item.public_key}/preview"
                         if item.media_kind in {"image", "video", "video_note"}
+                        or (item.media_kind == "sticker" and item.is_animation)
                         else None
                     ),
                     display_url=(
                         f"/media/{item.public_key}/display"
-                        if item.media_kind in {"image", "sticker"} else None
+                        if item.media_kind == "image"
+                        or (item.media_kind == "sticker" and not item.is_animation)
+                        else None
                     ),
                     content_url=(
                         f"/media/{item.public_key}/content"
                         if item.media_kind in {"audio", "voice", "video", "video_note"}
+                        or (item.media_kind == "sticker" and item.is_animation)
                         else None
                     ),
                     mime_type=item.canonical_mime_type or "image/webp",

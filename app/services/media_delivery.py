@@ -6,6 +6,7 @@ from typing import Protocol
 
 from app.repositories.media_delivery import DeliverableMedia, MediaDeliveryRepository
 from app.repositories.users import UserRecord
+from app.services.tgs_processing import TGS_MIME
 from app.services.video_processing import VIDEO_KINDS, VIDEO_MIME
 
 INTERNAL_ACCEL_PREFIX = "/_imageboard_media"
@@ -85,6 +86,31 @@ class MediaDeliveryService:
                     cache_control="no-store",
                 )
             return None
+        if media.media_kind == "sticker":
+            # все производные стикеров повторно проверяют видимость после модерации
+            if media.mime_type == TGS_MIME:
+                canonical = f"stickers/{media.id}.tgs"
+                preview = f"previews/{media.id}.webp"
+                if (
+                    media.canonical_path != canonical or media.canonical_mime_type != TGS_MIME
+                    or media.preview_path != preview
+                ):
+                    return None
+                if asset_kind == "content":
+                    return MediaDelivery(
+                        TGS_MIME, f"{INTERNAL_ACCEL_PREFIX}/{canonical}", cache_control="no-store",
+                    )
+                if asset_kind == "preview":
+                    return MediaDelivery(
+                        "image/webp", f"{INTERNAL_ACCEL_PREFIX}/sticker-{preview}",
+                        cache_control="no-store",
+                    )
+            elif asset_kind == "display" and media.display_path == f"display/{media.id}.webp":
+                return MediaDelivery(
+                    "image/webp", f"{INTERNAL_ACCEL_PREFIX}/stickers/{media.id}.webp",
+                    cache_control="no-store",
+                )
+            return None
         if asset_kind == "content":
             if media.media_kind not in {"audio", "voice"} or media.canonical_path is None:
                 return None
@@ -94,14 +120,6 @@ class MediaDeliveryService:
             return MediaDelivery(
                 content_type=media.canonical_mime_type or "application/octet-stream",
                 accel_path=f"{INTERNAL_ACCEL_PREFIX}/{media.canonical_path}",
-            )
-        if media.media_kind == "sticker":
-            if asset_kind != "display" or media.display_path != f"display/{media.id}.webp":
-                return None
-            # отдельный internal location оставляет проверку видимости за api после модерации
-            return MediaDelivery(
-                "image/webp", f"{INTERNAL_ACCEL_PREFIX}/stickers/{media.id}.webp",
-                cache_control="no-store",
             )
         if media.media_kind != "image":
             return None

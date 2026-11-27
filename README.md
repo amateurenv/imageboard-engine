@@ -56,7 +56,7 @@
   входом, досками и настройками через существующее API
 - CDN и production Nginx пока не настроены - есть только tracked template
 - для публикации `video_note` нужен будущий Telegram-адаптер
-- Telegram-бот, animated TGS/WebM stickers и антивирус ещё не реализованы
+- Telegram-бот, WebM-стикеры и антивирус ещё не реализованы
 - WebSocket-события, Telegram-бот и публичный frontend не готовы
 - нет production-конфигурации reverse proxy, HTTPS, резервного копирования и мониторинга
 
@@ -262,7 +262,8 @@ Nginx обслуживает Range для MP4. Видео и его превью
 квадратный MP4 как обычное видео, а публикация кружков зарезервирована для
 будущего Telegram-бота. [Telegram Bot API](https://core.telegram.org/bots/api#sendvideonote)
 
-Внутренний тип `sticker` принимает статический WebP до 512 КиБ. Длинная сторона
+Внутренний тип `sticker` принимает статический WebP до 512 КиБ и TGS до 64 КиБ.
+Для WebP длинная сторона
 должна быть ровно 512 px. Worker перекодирует файл с сохранением размеров и
 альфа-канала, убирает исходные метаданные и сохраняет один WebP display.
 Непрозрачный WebP тоже допустим и сохраняет непрозрачность.
@@ -272,11 +273,19 @@ Nginx обслуживает Range для MP4. Видео и его превью
 `sticker_cannot_start_thread`. Обычный WebP из публичной формы остаётся
 `image`. Публичные маршруты не загружают и не прикрепляют `sticker`.
 
-После публикации пост получает `media_kind: "sticker"` и `display_url`.
-Выдача стикера через Nginx использует `Cache-Control: no-store`, чтобы каждый
-повторный запрос проверял видимость поста и треда.
-По `media_kind` будущий интерфейс может показать WebP с прозрачностью без
-рамки и фона.
+TGS должен содержать векторную анимацию 512×512 px длительностью до 3 секунд.
+Worker проверяет gzip и структуру Lottie, записывает канонический TGS и
+рендерит первый кадр в прозрачный WebP. Для обработки TGS на Linux worker
+нужны системная библиотека rlottie (`librlottie0-1` в Ubuntu 24.04)
+и утилита `prlimit` из `util-linux`.
+При обновлении примени миграцию `023_animated_stickers`.
+[Требования Telegram к анимированным стикерам](https://core.telegram.org/stickers#animated-sticker-requirements)
+
+После публикации оба формата получают `media_kind: "sticker"`. У WebP есть
+`display_url`. У TGS есть `is_animation: true`, `preview_url` для WebP,
+`content_url` для канонической анимации с MIME `application/x-tgsticker` и
+`duration_seconds`, округлённая вверх. Все эти файлы выдаются с
+`Cache-Control: no-store` после проверки видимости поста и треда.
 
 Статичный image ограничен 12 000 px по каждой стороне и 20 миллионами пикселей.
 Для animation действуют серверные anti-resource-abuse пределы: до 4 096 px по
@@ -311,7 +320,7 @@ media и помечает claim consumed. Один claim нельзя испол
 | music/audio MP3/M4A/AAC | да | до 20 MiB, до 30 минут, до 2 каналов, 48 kHz |
 | voice OGG/Opus | да | до 20 MiB, до 10 минут, 1 канал, 48 kHz |
 | static sticker | внутренний сервис для будущего Telegram-бота | статический WebP, до 512 КиБ, длинная сторона ровно 512 px |
-| animated TGS sticker | запланировано | до 64 KiB, 512×512, до 3 секунд |
+| animated TGS sticker | внутренний сервис для будущего Telegram-бота | TGS до 64 КиБ, 512×512, до 3 секунд, прозрачное WebP-превью |
 | WebM video sticker | запланировано | VP9 без аудио, до 256 KiB, до 3 секунд и 512×512 |
 | Telegram custom emoji | запланировано | текстовая сущность с fallback |
 

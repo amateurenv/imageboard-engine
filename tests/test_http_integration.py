@@ -36,6 +36,7 @@ from app.services.posting_claims import (
     StickerCannotStartThread,
 )
 from app.services.sticker_processing import MAX_STICKER_BYTES, STICKER_REPLY_WARNING
+from app.services.tgs_processing import TGS_MIME, canonicalize_tgs
 from app.services.video_processing import VideoProcessor
 from app.ws.manager import DisabledWebSocketManager
 from scripts.cleanup_media_files import cleanup_media_files
@@ -46,10 +47,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("animated", [False, True], ids=["webp", "tgs"])
 async def test_internal_sticker_publication_visibility_and_cleanup(
     http_client: AsyncClient, monkeypatch: pytest.MonkeyPatch,
+    tgs_payload: bytes, animated: bool,
 ) -> None:
-    """проверить изоляцию claim, готовую выдачу и очистку статического стикера"""
+    """проверить одинаковые правила публикации и выдачу производных стикера"""
 
     pool = app.state.postgres_pool
     settings = app.state.site_settings
@@ -69,7 +72,9 @@ async def test_internal_sticker_publication_visibility_and_cleanup(
 
     image = BytesIO()
     Image.new("RGBA", (512, 128), (20, 90, 150, 67)).save(image, "WEBP")
-    payload = image.getvalue()
+    payload = tgs_payload if animated else image.getvalue()
+    mime = TGS_MIME if animated else "image/webp"
+    filename = "sticker.tgs" if animated else "sticker.webp"
     storage = MediaStorage(app.state.media_storage_root)
     upload = MediaUploadService(pool, app.state.redis_client, settings, storage.root)
     posting = PostingClaimsService(pool, settings)
@@ -87,6 +92,7 @@ async def test_internal_sticker_publication_visibility_and_cleanup(
 
     token, queued = await upload.stage_sticker(thread_id=thread_id, actor=author, data=payload)
     assert queued.media_kind == "sticker" and queued.processing_state.value == "queued"
+    assert queued.is_animation is animated and queued.mime_type == mime
     with pytest.raises(PostingClaimError, match="posting_claim_media_invalid"):
         await posting.publish_sticker(
             thread_id=thread_id, actor=author, token=token, media_id=queued.id,
@@ -99,12 +105,25 @@ async def test_internal_sticker_publication_visibility_and_cleanup(
     await process_job(repository, queued.id, storage, expected_lease=claimed.processing_lease_until)
     ready = await repository.get_by_id(queued.id)
     assert ready is not None and ready.processing_state.value == "ready"
-    assert ready.display_path == f"display/{queued.id}.webp" and ready.preview_path is None
-    canonical = storage.resolve(ready.display_path)
-    with Image.open(canonical) as rendered:
-        assert rendered.format == "WEBP" and rendered.size == (512, 128) and rendered.n_frames == 1
-        assert rendered.getpixel((1, 1))[3] == 67
-        assert canonical.stat().st_size <= MAX_STICKER_BYTES
+    if animated:
+        assert ready.preview_path == f"previews/{queued.id}.webp" and ready.display_path is None
+        assert ready.canonical_path == f"stickers/{queued.id}.tgs" and ready.duration_seconds == 2
+        canonical = storage.resolve(ready.canonical_path)
+        assert canonical.read_bytes() == canonicalize_tgs(payload)[1]
+        webp = storage.resolve(ready.preview_path)
+    else:
+        assert ready.display_path == f"display/{queued.id}.webp" and ready.preview_path is None
+        webp = canonical = storage.resolve(ready.display_path)
+    with Image.open(webp) as rendered:
+        assert rendered.format == "WEBP" and rendered.n_frames == 1
+        assert rendered.size == ((512, 512) if animated else (512, 128))
+        if animated:
+            assert rendered.getpixel((1, 1))[3] == 0
+            red, green, blue, alpha = rendered.getpixel((256, 256))
+            assert red > 230 and green < 15 and blue < 15 and 126 <= alpha <= 128
+        else:
+            assert rendered.getpixel((1, 1))[3] == 67
+        assert webp.stat().st_size <= MAX_STICKER_BYTES
     assert await cleanup_media_files(repository=repository, storage=storage) == 1
     assert not storage.resolve(queued.path).exists()
 
@@ -116,7 +135,7 @@ async def test_internal_sticker_publication_visibility_and_cleanup(
     assert blocked.json()["detail"]["code"] == "posting_claim_media_invalid"
     public_upload = await http_client.post(
         media_url, data={"posting_claim_token": token, "media_kind": "sticker"},
-        files={"file": ("sticker.webp", payload, "image/webp")},
+        files={"file": (filename, payload, mime)},
     )
     assert public_upload.status_code == 403
 
@@ -124,9 +143,14 @@ async def test_internal_sticker_publication_visibility_and_cleanup(
     normal_token = claim.json()["token"]
     ordinary = await http_client.post(
         media_url, data={"posting_claim_token": normal_token, "media_kind": "sticker"},
-        files={"file": ("sticker.webp", payload, "image/webp")},
+        files={"file": (filename, payload, mime)},
     )
-    assert ordinary.status_code == 201 and ordinary.json()["media_kind"] == "image"
+    if animated:
+        assert ordinary.status_code in {415, 422} and ordinary.json()["detail"]["code"] in {
+            "unsupported_media_type", "invalid_media",
+        }
+    else:
+        assert ordinary.status_code == 201 and ordinary.json()["media_kind"] == "image"
     with pytest.raises(PostingClaimError, match="posting_claim_forbidden"):
         await posting.publish_sticker(
             thread_id=thread_id, actor=other, token=token, media_id=queued.id,
@@ -178,29 +202,45 @@ async def test_internal_sticker_publication_visibility_and_cleanup(
     replies = page.json()["replies"]
     assert len(replies) == 1 and replies[0]["body"] == ""
     (item,) = replies[0]["media"]
-    assert item["media_kind"] == "sticker" and not item["is_animation"]
-    assert item["preview_url"] is None and item["content_url"] is None
-    url = item["display_url"]
-    internal_url = f"/_imageboard_media/stickers/{queued.id}.webp"
-    for method in (http_client.get, http_client.head):
-        delivered = await method(url)
-        assert delivered.status_code == 200 and delivered.content == b""
-        assert delivered.headers["content-type"] == "image/webp"
-        assert delivered.headers["x-accel-redirect"] == internal_url
-        assert delivered.headers["cache-control"] == "no-store"
-    for kind in ("preview", "content"):
-        assert (await http_client.get(url.removesuffix("display") + kind)).status_code == 404
+    assert item["media_kind"] == "sticker" and item["is_animation"] is animated
+    assert item["mime_type"] == mime
+    prefix = "/_imageboard_media"
+    if animated:
+        assert item["display_url"] is None and item["duration_seconds"] == 2
+        assets = {
+            "content": (TGS_MIME, f"{prefix}/stickers/{queued.id}.tgs"),
+            "preview": ("image/webp", f"{prefix}/sticker-previews/{queued.id}.webp"),
+        }
+        unavailable = ("display",)
+    else:
+        assert item["preview_url"] is None and item["content_url"] is None
+        assets = {"display": ("image/webp", f"{prefix}/stickers/{queued.id}.webp")}
+        unavailable = ("content", "preview")
+    for kind, (content_type, internal_url) in assets.items():
+        for method in (http_client.get, http_client.head):
+            delivered = await method(item[f"{kind}_url"])
+            assert delivered.status_code == 200 and delivered.content == b""
+            assert delivered.headers["content-type"] == content_type
+            assert delivered.headers["x-accel-redirect"] == internal_url
+            assert delivered.headers["cache-control"] == "no-store"
+            assert delivered.headers["x-content-type-options"] == "nosniff"
+    base_url = item[f"{next(iter(assets))}_url"].rsplit("/", 1)[0]
+    for kind in unavailable:
+        assert (await http_client.get(f"{base_url}/{kind}")).status_code == 404
     hidden = await http_client.patch(moderation_url, headers=csrf, json={"is_hidden": True})
     assert hidden.status_code == 200
-    assert (await http_client.get(url)).status_code == 404
+    for kind in assets:
+        assert (await http_client.get(item[f"{kind}_url"])).status_code == 404
     assert (await http_client.delete(moderation_url, headers=csrf)).status_code == 204
-    assert await cleanup_media_files(repository=repository, storage=storage) == 1
-    assert not canonical.exists()
+    assert await cleanup_media_files(repository=repository, storage=storage) == len(assets)
+    assert not canonical.exists() and not webp.exists()
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("animated", [False, True], ids=["webp", "tgs"])
 async def test_sticker_worker_replace_failure_keeps_quarantine_until_claim_expires(
     http_client: AsyncClient, monkeypatch: pytest.MonkeyPatch,
+    tgs_payload: bytes, animated: bool,
 ) -> None:
     """проверить откат готовности при файловой ошибке и очистку истёкшего claim"""
 
@@ -216,7 +256,8 @@ async def test_sticker_worker_replace_failure_keeps_quarantine_until_claim_expir
     image = BytesIO()
     Image.new("RGBA", (240, 512), (0, 0, 0, 0)).save(image, "WEBP", lossless=True)
     _, queued = await upload.stage_sticker(
-        thread_id=thread.json()["thread"]["id"], actor=actor, data=image.getvalue(),
+        thread_id=thread.json()["thread"]["id"], actor=actor,
+        data=tgs_payload if animated else image.getvalue(),
     )
     repository = MediaRepository(pool)
     claimed = await repository.claim_by_id(
@@ -224,7 +265,11 @@ async def test_sticker_worker_replace_failure_keeps_quarantine_until_claim_expir
     )
     assert claimed is not None
 
-    def reject_replace(_temporary: Path, _relative_path: str) -> Path:
+    replace = storage.replace_from_temporary
+
+    def reject_replace(temporary: Path, relative_path: str) -> Path:
+        if relative_path.endswith(".tgs"):
+            return replace(temporary, relative_path)
         raise OSError("simulated storage failure")
 
     with monkeypatch.context() as patch:
@@ -234,11 +279,12 @@ async def test_sticker_worker_replace_failure_keeps_quarantine_until_claim_expir
 
     media = await repository.get_by_id(queued.id)
     assert media is not None and media.processing_state.value == "processing"
-    assert media.display_path is None and storage.resolve(media.path).is_file()
-    assert not list((storage.root / "display").iterdir())
+    assert (media.display_path, media.canonical_path, media.preview_path) == (None, None, None)
+    assert list(storage.root.rglob("*.*")) == [storage.resolve(media.path)]
     assert await cleanup_media_files(repository=repository, storage=storage) == 0
     await process_job(repository, queued.id, storage, expected_lease=claimed.processing_lease_until)
-    assert storage.resolve(f"display/{queued.id}.webp").is_file()
+    path = f"stickers/{queued.id}.tgs" if animated else f"display/{queued.id}.webp"
+    assert storage.resolve(path).is_file()
 
     await pool.execute(
         "UPDATE posting_claims SET expires_at = clock_timestamp() WHERE id = $1",
@@ -246,7 +292,8 @@ async def test_sticker_worker_replace_failure_keeps_quarantine_until_claim_expir
     )
     assert await PostingClaimsRepository(pool).cleanup_expired() == 1
     assert await repository.get_by_id(queued.id) is None
-    assert await cleanup_media_files(repository=repository, storage=storage) == 2
+    cleanup_count = await cleanup_media_files(repository=repository, storage=storage)
+    assert cleanup_count == (3 if animated else 2)
     assert not [file for file in storage.root.rglob("*") if file.is_file()]
 
 

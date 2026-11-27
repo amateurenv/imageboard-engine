@@ -51,7 +51,7 @@ def decode_sticker(data: bytes) -> Image.Image:
         if offset > len(data):
             raise MediaPolicy.invalid_media("повреждён блок WebP")
         if tag in {b"ANIM", b"ANMF"} or (tag == b"VP8X" and size and data[start] & 2):
-            raise MediaPolicy.invalid_media("анимированные стикеры не поддерживаются")
+            raise MediaPolicy.invalid_media("WebP-стикер должен быть статическим")
         if tag == b"VP8X" and size == 10:
             _check_dimensions(
                 int.from_bytes(data[start + 4:start + 7], "little") + 1,
@@ -69,7 +69,7 @@ def decode_sticker(data: bytes) -> Image.Image:
     try:
         with Image.open(BytesIO(data), formats=["WEBP"]) as source:
             if getattr(source, "n_frames", 1) != 1:
-                raise MediaPolicy.invalid_media("анимированные стикеры не поддерживаются")
+                raise MediaPolicy.invalid_media("WebP-стикер должен быть статическим")
             _check_dimensions(*source.size)
             # convert декодирует кадр целиком и оставляет цвет и прозрачность в пикселях
             return source.convert("RGBA")

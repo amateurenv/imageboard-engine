@@ -18,6 +18,7 @@ from app.services.media_queue import MediaProcessingState
 from app.services.media_scanner import MediaScanner, NoopMediaScanner
 from app.services.media_storage import MediaStorage
 from app.services.sticker_processing import transcode_sticker
+from app.services.tgs_processing import transcode_tgs
 from app.services.video_processing import VIDEO_KINDS, VideoProcessor
 
 # redis будит worker раньше следующей проверки, но postgresql остаётся источником истины
@@ -164,6 +165,55 @@ async def _process_video(
         preview.unlink(missing_ok=True)
 
 
+async def _process_sticker(
+    repository: MediaRepository, media: MediaRecord, storage: MediaStorage,
+) -> None:
+    """подготовить производные стикера и открыть их только после commit под lease"""
+
+    lease = media.processing_lease_until
+    if lease is None:
+        raise RuntimeError("media processing lease was lost")
+    source = storage.resolve(media.path)
+    display_path = preview_path = canonical_path = None
+    conversion: asyncio.Task[int] | asyncio.Task[None]
+    if media.is_animation:
+        canonical_path = f"stickers/{media.id}.tgs"
+        preview_path = f"previews/{media.id}.webp"
+        canonical = storage.temporary_path(canonical_path)
+        preview = storage.temporary_path(preview_path)
+        derivatives = [(canonical, canonical_path), (preview, preview_path)]
+        conversion = asyncio.create_task(
+            asyncio.to_thread(transcode_tgs, source, canonical, preview)
+        )
+    else:
+        display_path = f"display/{media.id}.webp"
+        display = storage.temporary_path(display_path)
+        derivatives = [(display, display_path)]
+        conversion = asyncio.create_task(asyncio.to_thread(transcode_sticker, source, display))
+    try:
+        duration = await asyncio.shield(conversion)
+        async with repository.transaction() as connection:
+            ready = await repository.mark_sticker_ready(
+                connection, media.id, lease=lease, display_path=display_path,
+                preview_path=preview_path, canonical_path=canonical_path, duration_seconds=duration,
+            )
+            if not ready:
+                raise RuntimeError("media processing lease was lost")
+            # при сбое убираем частичный результат, пока другой worker не получил строку
+            try:
+                for temporary, path in derivatives:
+                    storage.replace_from_temporary(temporary, path)
+            except Exception:
+                for _, path in derivatives:
+                    storage.delete_file(path)
+                raise
+    finally:
+        if not conversion.done():
+            await asyncio.gather(conversion, return_exceptions=True)
+        for temporary, _ in derivatives:
+            temporary.unlink(missing_ok=True)
+
+
 async def process_job(
     repository: MediaRepository,
     media_id: int,
@@ -185,28 +235,7 @@ async def process_job(
     # production scanner подключат здесь - до derivative и перевода media в ready
     await asyncio.to_thread((scanner or NoopMediaScanner()).scan, source_path)
     if media.media_kind == MediaType.STICKER:
-        lease = media.processing_lease_until
-        if lease is None:
-            raise RuntimeError("media processing lease was lost")
-        display_path = f"display/{media.id}.webp"
-        temporary = storage.temporary_path(display_path)
-        conversion = asyncio.create_task(
-            asyncio.to_thread(transcode_sticker, source_path, temporary)
-        )
-        try:
-            await asyncio.shield(conversion)
-            async with repository.transaction() as connection:
-                ready_sticker = await repository.mark_sticker_ready(
-                    connection, media.id, lease=lease, display_path=display_path,
-                )
-                if not ready_sticker:
-                    raise RuntimeError("media processing lease was lost")
-                # выдача станет возможна после замены файла и коммита ready
-                storage.replace_from_temporary(temporary, display_path)
-        finally:
-            if not conversion.done():
-                await asyncio.gather(conversion, return_exceptions=True)
-            temporary.unlink(missing_ok=True)
+        await _process_sticker(repository, media, storage)
         return
     if media.media_kind in VIDEO_KINDS:
         settings = get_settings()

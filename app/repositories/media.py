@@ -129,7 +129,11 @@ WITH ready AS (
     SET processing_state = 'ready',
         processing_lease_until = NULL,
         last_processing_error = NULL,
-        display_path = $3
+        display_path = $3,
+        preview_path = $4,
+        canonical_path = $5,
+        canonical_mime_type = CASE WHEN is_animation THEN 'application/x-tgsticker' END,
+        duration_seconds = $6
     WHERE id = $1 AND processing_state = 'processing' AND media_kind = 'sticker'
       AND processing_lease_until = $2 AND processing_lease_until > clock_timestamp()
     RETURNING path
@@ -447,12 +451,15 @@ class MediaRepository:
         ) is not None
 
     async def mark_sticker_ready(
-        self, connection: Connection, media_id: int, *, lease: datetime, display_path: str,
+        self, connection: Connection, media_id: int, *, lease: datetime,
+        display_path: str | None, preview_path: str | None,
+        canonical_path: str | None, duration_seconds: int | None,
     ) -> bool:
         """запланировать очистку quarantine в той же транзакции, что и готовность стикера"""
 
         return await connection.fetchval(
-            MARK_STICKER_READY_SQL, media_id, lease, display_path,
+            MARK_STICKER_READY_SQL, media_id, lease, display_path, preview_path,
+            canonical_path, duration_seconds,
         ) is not None
 
     async def fail_processing(
