@@ -20,6 +20,10 @@ realtime, расширить минимальный `/admin` и подготов
 
 ## worker, очистка и мониторинг
 
+Шаблоны доступны в `main3` с `9ac06be`. В WSL проверены синтаксис unit-файлов,
+восстановление worker и очистка после повторной обработки. На целевом сервере
+проверь запуск таймеров, записи в journald и выдачу через Nginx.
+
 После инвентаризации скопируй примеры из `deploy/` в `/etc/systemd/system/`,
 убрав суффикс `.example`. В `imageboard-media-worker.service`,
 `imageboard-cleanup.service` и `imageboard-media-monitor.service` сверь
