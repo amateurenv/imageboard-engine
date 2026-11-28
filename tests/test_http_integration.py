@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import timedelta
 from io import BytesIO
 from pathlib import Path
@@ -19,17 +19,23 @@ from urllib.parse import urlencode, urlsplit
 import asyncpg
 import pytest
 import uvicorn
+from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient, Response, TransportError
 from PIL import Image
 from redis.asyncio import Redis
+from redis.exceptions import RedisError
+from websockets.asyncio.client import ClientConnection, connect
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from app.api.dependencies import (
     get_postgres_pool,
     get_redis_client,
     get_site_settings,
-    get_ws_manager,
 )
-from app.core.security import CSRF_COOKIE, hash_password, hash_token
+from app.api.system import router as system_router
+from app.api.v1.ws import router as ws_router
+from app.core.config import get_settings
+from app.core.security import CSRF_COOKIE, SESSION_COOKIE, hash_password, hash_token
 from app.core.site_settings import SiteSettings
 from app.main import app
 from app.repositories.media import MediaRepository
@@ -44,11 +50,12 @@ from app.services.posting_claims import (
     PostingClaimsService,
     StickerCannotStartThread,
 )
+from app.services.realtime import publish_pending_events
 from app.services.sticker_processing import MAX_STICKER_BYTES, STICKER_REPLY_WARNING
 from app.services.tgs_processing import TGS_MIME, canonicalize_tgs
 from app.services.video_processing import VideoProcessor
 from app.services.video_sticker_processing import WEBM_STICKER_MIME
-from app.ws.manager import DisabledWebSocketManager
+from app.ws.manager import WebSocketManager
 from scripts.cleanup_media_files import cleanup_media_files
 from scripts.inventory_media_storage import inventory_media_storage
 from scripts.media_worker import MAX_PROCESSING_ATTEMPTS, PROCESSING_LEASE, process_job
@@ -69,7 +76,10 @@ def media_files(storage: MediaStorage) -> list[Path]:
 
 
 @asynccontextmanager
-async def nginx_client(nginx: str, root: Path, tmp_path: Path):
+async def nginx_client(
+    nginx: str, root: Path, tmp_path: Path, *,
+    application: FastAPI = app, uvicorn_env: dict[str, str] | None = None,
+):
     """пропустить запрос через реальные internal locations шаблона nginx"""
 
     with socket.socket() as upstream, socket.socket() as address:
@@ -97,10 +107,27 @@ async def nginx_client(nginx: str, root: Path, tmp_path: Path):
             "uwsgi_temp_path uwsgi;\nscgi_temp_path scgi;\n"
             f"{server_config}\n}}\n", encoding="utf-8",
         )
-        server = uvicorn.Server(uvicorn.Config(app, lifespan="off", log_level="warning"))
-        task = asyncio.create_task(server.serve(sockets=[upstream]))
+        server = None
+        task = None
+        workers = None
         process = None
         try:
+            if uvicorn_env is None:
+                server = uvicorn.Server(uvicorn.Config(
+                    application, lifespan="off", log_level="warning",
+                    ws="websockets", ws_max_size=2048, ws_max_queue=4, ws_per_message_deflate=False,
+                ))
+                task = asyncio.create_task(server.serve(sockets=[upstream]))
+            else:
+                upstream_port = upstream.getsockname()[1]
+                upstream.close()
+                workers = await asyncio.create_subprocess_exec(
+                    sys.executable, "-m", "uvicorn", "app.main:app",
+                    "--host", "127.0.0.1", "--port", str(upstream_port), "--workers", "2",
+                    "--ws", "websockets", "--ws-max-size", "2048", "--ws-max-queue", "4",
+                    "--ws-per-message-deflate", "false", "--log-level", "warning",
+                    env=uvicorn_env,
+                )
             process = await asyncio.create_subprocess_exec(
                 nginx, "-p", str(tmp_path) + "/", "-c", str(config),
             )
@@ -108,6 +135,8 @@ async def nginx_client(nginx: str, root: Path, tmp_path: Path):
                 for _ in range(100):
                     if process.returncode is not None:
                         pytest.fail(f"nginx exited with code {process.returncode}")
+                    if workers is not None and workers.returncode is not None:
+                        pytest.fail(f"uvicorn exited with code {workers.returncode}")
                     try:
                         if (await client.get("/health", timeout=1)).status_code == 200:
                             break
@@ -121,8 +150,12 @@ async def nginx_client(nginx: str, root: Path, tmp_path: Path):
             if process is not None and process.returncode is None:
                 process.terminate()
                 await process.wait()
-            server.should_exit = True
-            await task
+            if server is not None and task is not None:
+                server.should_exit = True
+                await task
+            if workers is not None and workers.returncode is None:
+                workers.terminate()
+                await asyncio.wait_for(workers.wait(), 10)
 
 
 @pytest.mark.anyio
@@ -504,12 +537,10 @@ async def http_client(
     if not before_quota:
         await inventory_media_storage(app.state.media_quota)
     monkeypatch.setattr(tempfile, "tempdir", str(storage.prepare_parent(".spool/ready").parent))
-    app.state.ws_manager = DisabledWebSocketManager()
     app.dependency_overrides = {
         get_postgres_pool: lambda: pool,
         get_redis_client: lambda: redis,
         get_site_settings: lambda: settings,
-        get_ws_manager: lambda: app.state.ws_manager,
     }
 
     users = UsersRepository(pool)
@@ -543,6 +574,286 @@ async def login(client: AsyncClient, login_name: str, password: str) -> dict[str
     csrf_token = client.cookies.get(CSRF_COOKIE)
     assert csrf_token is not None
     return {"x-csrf-token": csrf_token}
+
+
+WS_ORIGIN = "https://board.test"
+
+
+@asynccontextmanager
+async def realtime_application(redis: Redis):
+    """поднять маршрут и relay на выделенном redis для перезапуска"""
+
+    channel = f"test:realtime:{uuid.uuid4().hex}"
+    pool = app.state.postgres_pool
+    manager = WebSocketManager(redis, channel)
+    relay = asyncio.create_task(publish_pending_events(pool, redis, channel))
+    listener = asyncio.create_task(manager.consume_redis())
+    settings = get_settings().model_copy(update={
+        "realtime_enabled": True,
+        "realtime_allowed_origins": WS_ORIGIN,
+    })
+    try:
+        await asyncio.wait_for(manager.ready.wait(), 8)
+        application = FastAPI()
+        application.state.postgres_pool = pool
+        application.state.ws_manager = manager
+        application.dependency_overrides[get_settings] = lambda: settings
+        application.include_router(system_router)
+        application.include_router(ws_router, prefix="/api/v1")
+        yield application, manager
+    finally:
+        relay.cancel()
+        listener.cancel()
+        await asyncio.gather(relay, listener, return_exceptions=True)
+
+
+async def receive_realtime(client: ClientConnection) -> dict:
+    """прочитать уведомление с ограниченным ожиданием"""
+
+    return json.loads(await asyncio.wait_for(client.recv(), 8))
+
+
+async def subscribe_realtime(client: ClientConnection, scope: str) -> dict:
+    """передать команду подписки и дождаться ответа"""
+
+    await client.send(json.dumps({"type": "subscribe", "scope": scope}))
+    return await receive_realtime(client)
+
+
+@pytest.mark.anyio
+async def test_realtime_visibility_and_fanout_through_nginx(
+    http_client: AsyncClient, tmp_path: Path,
+) -> None:
+    """проверить origin, сессию, изоляцию и рассылку при параллельном чтении"""
+
+    nginx = shutil.which("nginx")
+    if nginx is None:
+        pytest.skip("Nginx is required")
+
+    await register(http_client, "alice")
+    csrf = await login(http_client, "owner", "owner-password")
+    assert (await http_client.post(
+        "/api/v1/admin/boards", headers=csrf, json={"slug": "other", "title": "Other"},
+    )).status_code == 200
+    session = http_client.cookies[SESSION_COOKIE]
+    pool = app.state.postgres_pool
+    schema = await pool.fetchval("SELECT current_schema()")
+    database = urlsplit(os.environ["TEST_DATABASE_URL"])
+    query = "&".join(filter(None, (database.query, urlencode({"search_path": schema}))))
+    channel = f"test:realtime:{uuid.uuid4().hex}"
+    env = {
+        **os.environ,
+        "APP_ENV": "test",
+        "DATABASE_URL": database._replace(query=query).geturl(),
+        "REDIS_URL": os.environ["TEST_REDIS_URL"],
+        "MEDIA_STORAGE_ROOT": str(app.state.media_storage_root),
+        "REALTIME_ENABLED": "true",
+        "REALTIME_ALLOWED_ORIGINS": WS_ORIGIN,
+        "REALTIME_CHANNEL": channel,
+    }
+    async with (
+        nginx_client(
+            nginx, app.state.media_storage_root, tmp_path, uvicorn_env=env
+        ) as proxy,
+        AsyncExitStack() as clients,
+    ):
+        async with asyncio.timeout(8):
+            while dict(await app.state.redis_client.pubsub_numsub(channel))[channel] < 2:
+                await asyncio.sleep(0.05)
+        endpoint = str(proxy.base_url).replace("http:", "ws:") + "/api/v1/ws"
+        for headers in (
+            {"origin": "https://foreign.test"},
+            {"additional_headers": {"Cookie": f"{SESSION_COOKIE}={session}"}},
+            {"origin": WS_ORIGIN, "additional_headers": {"Cookie": f"{SESSION_COOKIE}=bad"}},
+        ):
+            with pytest.raises(InvalidStatus) as rejected:
+                async with connect(endpoint, **headers):
+                    pytest.fail("unexpected websocket upgrade")
+            assert rejected.value.response.status_code == 403
+
+        sockets = await asyncio.gather(*(
+            clients.enter_async_context(connect(endpoint, origin=WS_ORIGIN)) for _ in range(24)
+        ))
+        scope = "board:alice"
+        registered = await asyncio.gather(*(subscribe_realtime(ws, scope) for ws in sockets))
+        assert registered == [{"type": "subscribed", "scope": scope}] * len(sockets)
+
+        isolated = await clients.enter_async_context(connect(endpoint, origin=WS_ORIGIN))
+        assert await subscribe_realtime(isolated, "board:other") == {
+            "type": "subscribed", "scope": "board:other",
+        }
+        assert await subscribe_realtime(isolated, "thread:999999") == {
+            "type": "error", "detail": "subscription rejected",
+        }
+
+        created = await http_client.post("/api/v1/boards/alice/threads", json={"body": "op"})
+        assert created.status_code == 201
+        thread_id = created.json()["thread"]["id"]
+        path = f"/api/v1/threads/{thread_id}"
+        thread_scope = f"thread:{thread_id}"
+        reading = asyncio.gather(*(proxy.get(path, timeout=3) for _ in range(20)))
+        board_changed = {"type": "changed", "scope": scope}
+        assert await asyncio.gather(*(receive_realtime(ws) for ws in sockets)) == [
+            board_changed
+        ] * len(sockets)
+        assert all(response.status_code == 200 for response in await reading)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(isolated.recv(), 0.1)
+
+        thread_client = await clients.enter_async_context(connect(
+            endpoint, origin=WS_ORIGIN,
+            additional_headers={"Cookie": f"{SESSION_COOKIE}={session}"},
+        ))
+        assert await subscribe_realtime(thread_client, thread_scope) == {
+            "type": "subscribed", "scope": thread_scope,
+        }
+        changed = {"type": "changed", "scope": thread_scope}
+        reply = await http_client.post(f"{path}/posts", json={"body": "private-to-frame-test"})
+        assert reply.status_code == 200
+        post_id = reply.json()["id"]
+        assert await receive_realtime(thread_client) == changed
+        for hidden in (True, False):
+            assert (await http_client.patch(
+                f"/api/v1/profiles/alice/posts/{post_id}",
+                headers=csrf, json={"is_hidden": hidden},
+            )).status_code == 200
+            assert await receive_realtime(thread_client) == changed
+            replies = (await http_client.get(path)).json()["replies"]
+            assert bool(replies) is not hidden
+        assert (await http_client.request(
+            "DELETE", f"/api/v1/posts/{post_id}", headers=csrf, json={},
+        )).status_code == 204
+        assert await receive_realtime(thread_client) == changed
+
+        for value in (True, False):
+            assert (await http_client.patch(
+                f"/api/v1/admin/threads/{thread_id}",
+                headers=csrf, json={"is_sticky": value, "is_locked": value},
+            )).status_code == 200
+            assert await receive_realtime(thread_client) == changed
+
+        async with pool.acquire() as connection:
+            transaction = connection.transaction()
+            await transaction.start()
+            await connection.execute("UPDATE threads SET is_locked = true WHERE id = $1", thread_id)
+            await transaction.rollback()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(thread_client.recv(), 0.8)
+
+        moderate = f"/api/v1/profiles/alice/threads/{thread_id}"
+        unavailable = {"type": "unavailable", "scope": thread_scope}
+        assert (await http_client.patch(
+            moderate, headers=csrf, json={"is_hidden": True}
+        )).is_success
+        assert await receive_realtime(thread_client) == unavailable
+        assert (await http_client.get(path)).status_code == 404
+        assert await subscribe_realtime(thread_client, thread_scope) == {
+            "type": "error", "detail": "subscription rejected",
+        }
+        assert (await http_client.patch(
+            moderate, headers=csrf, json={"is_hidden": False}
+        )).is_success
+        assert await subscribe_realtime(thread_client, thread_scope) == {
+            "type": "subscribed", "scope": thread_scope,
+        }
+        assert (await http_client.delete(
+            f"/api/v1/admin/threads/{thread_id}", headers=csrf
+        )).is_success
+        # поздняя доставка unhide также допустима, состояние всегда перечитывается из rest
+        message = await receive_realtime(thread_client)
+        if message == changed:
+            message = await receive_realtime(thread_client)
+        assert message == unavailable
+        assert (await http_client.get(path)).status_code == 404
+
+        assert (await http_client.patch(
+            "/api/v1/admin/boards/other", headers=csrf, json={"is_active": False},
+        )).status_code == 200
+        assert await receive_realtime(isolated) == {"type": "unavailable", "scope": "board:other"}
+        assert await subscribe_realtime(isolated, "board:other") == {
+            "type": "error", "detail": "subscription rejected",
+        }
+
+
+@asynccontextmanager
+async def isolated_redis(server: str, unix_socket: Path, redis: Redis):
+    """запустить выделенный redis, который можно остановить для проверки восстановления"""
+
+    process = await asyncio.create_subprocess_exec(
+        server, "--port", "0", "--unixsocket", str(unix_socket), "--save", "", "--appendonly", "no",
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        for _ in range(100):
+            if process.returncode is not None:
+                pytest.fail("isolated redis failed to start")
+            try:
+                if await redis.ping():
+                    break
+            except RedisError:
+                await asyncio.sleep(0.05)
+        else:
+            pytest.fail("isolated redis did not start")
+        yield
+    finally:
+        if process.returncode is None:
+            process.terminate()
+            await asyncio.wait_for(process.wait(), 5)
+
+
+@pytest.mark.anyio
+async def test_realtime_survives_redis_restart(http_client: AsyncClient, tmp_path: Path) -> None:
+    """проверить разрыв при сбое, сохранённую очередь и rest после переподключения"""
+
+    server = shutil.which("redis-server")
+    nginx = shutil.which("nginx")
+    if server is None or nginx is None:
+        pytest.skip("redis-server and Nginx are required")
+    csrf = await login(http_client, "owner", "owner-password")
+    assert (await http_client.post(
+        "/api/v1/admin/boards", headers=csrf, json={"slug": "recovery", "title": "Recovery"},
+    )).is_success
+    created = await http_client.post("/api/v1/boards/recovery/threads", json={"body": "op"})
+    path = f"/api/v1/threads/{created.json()['thread']['id']}"
+    patch = f"/api/v1/admin/threads/{created.json()['thread']['id']}"
+    pool = app.state.postgres_pool
+    socket_path = tmp_path / "r.sock"
+    redis = Redis(unix_socket_path=str(socket_path), decode_responses=True)
+    async with redis, AsyncExitStack() as runtime:
+        broker = AsyncExitStack()
+        async with broker:
+            await broker.enter_async_context(isolated_redis(server, socket_path, redis))
+            application, manager = await runtime.enter_async_context(realtime_application(redis))
+            proxy = await runtime.enter_async_context(nginx_client(
+                nginx, app.state.media_storage_root, tmp_path, application=application,
+            ))
+            endpoint = str(proxy.base_url).replace("http:", "ws:") + "/api/v1/ws"
+            client = await runtime.enter_async_context(connect(endpoint, origin=WS_ORIGIN))
+            scope = f"thread:{created.json()['thread']['id']}"
+            assert await subscribe_realtime(client, scope) == {"type": "subscribed", "scope": scope}
+
+        with pytest.raises(ConnectionClosed) as closed:
+            while True:
+                await receive_realtime(client)
+        assert closed.value.rcvd is not None and closed.value.rcvd.code == 1013
+        assert (await http_client.patch(patch, headers=csrf, json={"is_locked": True})).is_success
+        assert await pool.fetchval("SELECT count(*) FROM realtime_outbox") > 0
+
+        async with isolated_redis(server, socket_path, redis):
+            await asyncio.wait_for(manager.ready.wait(), 8)
+            async with asyncio.timeout(8):
+                while await pool.fetchval("SELECT count(*) FROM realtime_outbox"):
+                    await asyncio.sleep(0.05)
+            async with connect(endpoint, origin=WS_ORIGIN) as client:
+                assert await subscribe_realtime(client, scope) == {
+                    "type": "subscribed", "scope": scope,
+                }
+                assert (await http_client.get(path)).json()["thread"]["is_locked"]
+                assert (await http_client.patch(
+                    patch, headers=csrf, json={"is_locked": False}
+                )).is_success
+                assert await receive_realtime(client) == {"type": "changed", "scope": scope}
+                assert not (await http_client.get(path)).json()["thread"]["is_locked"]
 
 
 async def register(client: AsyncClient, handle: str, password: str = "profile-password") -> None:

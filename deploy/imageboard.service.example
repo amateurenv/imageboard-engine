@@ -7,7 +7,7 @@ Type=simple
 User=imageboard
 WorkingDirectory=/srv/imageboard-engine
 EnvironmentFile=/etc/imageboard-engine.env
-ExecStart=/srv/imageboard-engine/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+ExecStart=/srv/imageboard-engine/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --ws websockets --ws-max-size 2048 --ws-max-queue 4 --ws-per-message-deflate false
 Restart=on-failure
 RestartSec=5
 

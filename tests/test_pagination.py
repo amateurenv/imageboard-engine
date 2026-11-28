@@ -153,18 +153,11 @@ class FakeThreadsRepository:
         )
 
 
-class FakeWsManager:
-    """заглушка websocket для чтения"""
-
-    async def broadcast(self, event: dict[str, object]) -> None:
-        """не отправлять события в unit тесте"""
-
-
 @pytest.mark.anyio
 async def test_service_returns_thread_page_with_next_cursor() -> None:
     """service обрезает лишнюю запись и создаёт следующий cursor"""
 
-    service = ThreadsService(FakeThreadsRepository(), SiteSettings(), FakeWsManager())
+    service = ThreadsService(FakeThreadsRepository(), SiteSettings())
 
     response = await service.list_threads("b", None, 2)
 
@@ -178,7 +171,7 @@ async def test_service_returns_thread_page_with_next_cursor() -> None:
 async def test_service_returns_op_and_replies_in_time_order() -> None:
     """OP не дублируется, а ответы приходят от старого к новому"""
 
-    service = ThreadsService(FakeThreadsRepository(), SiteSettings(), FakeWsManager())
+    service = ThreadsService(FakeThreadsRepository(), SiteSettings())
 
     response = await service.get_thread(7, None, 2)
 

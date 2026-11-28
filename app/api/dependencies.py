@@ -32,7 +32,7 @@ from app.services.video_processing import VideoProcessor
 from app.ws.manager import WebSocketManager
 
 
-def get_postgres_pool(request: Request) -> Pool:
+def get_postgres_pool(request: HTTPConnection) -> Pool:
     """вернуть общий пул подключений к postgresql"""
 
     # пул создаётся при запуске fastapi и хранится в состоянии приложения
@@ -95,7 +95,7 @@ type SiteSettingsDependency = Annotated[
 
 
 def get_ws_manager(connection: HTTPConnection) -> WebSocketManager:
-    """вернуть websocket-менеджер приложения (работает и для HTTP, и для WS)"""
+    """вернуть websocket-менеджер приложения"""
 
     return connection.app.state.ws_manager
 
@@ -109,7 +109,6 @@ type WsManagerDependency = Annotated[
 def get_threads_service(
     postgres_pool: PostgresPoolDependency,
     site_settings: SiteSettingsDependency,
-    ws_manager: WsManagerDependency,
 ) -> ThreadsService:
     """создать service для одного http-запроса"""
 
@@ -117,7 +116,7 @@ def get_threads_service(
     repository = ThreadsRepository(postgres_pool)
 
     claims = PostingClaimsService(postgres_pool, site_settings)
-    return ThreadsService(repository, site_settings, ws_manager, claims)
+    return ThreadsService(repository, site_settings, claims)
 
 
 type ThreadsServiceDependency = Annotated[

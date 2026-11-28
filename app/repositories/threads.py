@@ -88,7 +88,7 @@ UPDATE_THREAD_SQL = """
 UPDATE threads
 SET subject = $2, is_sticky = $3, is_locked = $4, is_archived = $5
 WHERE id = $1
-RETURNING id, subject, is_sticky, is_locked, is_archived, created_at, bumped_at
+RETURNING id, thread_number, subject, is_sticky, is_locked, is_archived, created_at, bumped_at
 """
 
 CREATE_POST_SQL = """

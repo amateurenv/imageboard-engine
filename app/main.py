@@ -1,5 +1,6 @@
 """точка входа asgi приложения"""
 
+import asyncio
 import tempfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -11,13 +12,15 @@ from app.api.admin_ui import router as admin_ui_router
 from app.api.media_delivery import router as media_delivery_router
 from app.api.system import router as system_router
 from app.api.v1.router import router as api_v1_router
+from app.api.v1.ws import router as ws_router
 from app.core.config import get_settings
 from app.core.database import close_postgres_pool, create_postgres_pool
 from app.core.redis import close_redis_client, create_redis_client
 from app.core.site_settings_repository import load_site_settings
 from app.services.media_quota import MediaQuota
 from app.services.media_storage import MediaStorage
-from app.ws.manager import DisabledWebSocketManager
+from app.services.realtime import publish_pending_events
+from app.ws.manager import WebSocketManager
 
 # получаем проверенные настройки один раз для всего процесса
 settings = get_settings()
@@ -61,13 +64,23 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         await close_redis_client(redis_client)
         raise
 
-    # realtime временно выключен до отдельной безопасной переработки
-    application.state.ws_manager = DisabledWebSocketManager()
+    manager = WebSocketManager(redis_client, settings.realtime_channel)
+    application.state.ws_manager = manager
+    # держим очередь в рабочем состоянии и при выключенном публичном маршруте
+    realtime_tasks = (
+        asyncio.create_task(manager.consume_redis()),
+        asyncio.create_task(
+            publish_pending_events(postgres_pool, redis_client, settings.realtime_channel)
+        ),
+    )
 
     try:
         # после yield fastapi начинает принимать запросы
         yield
     finally:
+        for task in realtime_tasks:
+            task.cancel()
+        await asyncio.gather(*realtime_tasks, return_exceptions=True)
         # закрываем подключения при штатной остановке или Ctrl+C
         await close_postgres_pool(application.state.postgres_pool)
         await close_redis_client(application.state.redis_client)
@@ -98,3 +111,5 @@ app.include_router(media_delivery_router)
 
 # подключаем первую версию публичного API
 app.include_router(api_v1_router)
+if settings.realtime_enabled:
+    app.include_router(ws_router, prefix=api_v1_router.prefix)

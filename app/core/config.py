@@ -4,6 +4,7 @@
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal, Self
+from urllib.parse import urlsplit
 
 # BaseSettings читает переменные окружения, SettingsConfigDict задаёт правила
 from pydantic import Field, PostgresDsn, RedisDsn, model_validator
@@ -30,6 +31,12 @@ class Settings(BaseSettings):
     # адрес redis из REDIS_URL в .env
     redis_url: RedisDsn
 
+    realtime_enabled: bool = False
+    realtime_allowed_origins: str = ""
+    realtime_channel: str = Field(
+        default="imageboard:realtime:v1", pattern=r"^[a-zA-Z0-9:_-]{1,120}$"
+    )
+
     # корень закрытого media storage, не подключать к static или reverse proxy на этом этапе
     media_storage_root: Path = Path("media")
     media_storage_max_bytes: int = Field(default=8 * 1024**3, gt=0, le=2**63 - 1)
@@ -55,7 +62,27 @@ class Settings(BaseSettings):
             raise ValueError("MEDIA_STORAGE_MAX_BYTES must exceed the multipart budget")
         if self.app_env == "production" and not self.media_storage_root.is_absolute():
             raise ValueError("MEDIA_STORAGE_ROOT must be an absolute mount path in production")
+        if self.realtime_enabled and not self.realtime_origins:
+            raise ValueError("REALTIME_ALLOWED_ORIGINS is required when realtime is enabled")
+        for origin in self.realtime_origins:
+            parsed = urlsplit(origin)
+            if (
+                parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or parsed.username is not None or parsed.path or parsed.query or parsed.fragment
+                or "*" in origin or origin != f"{parsed.scheme}://{parsed.netloc}"
+            ):
+                raise ValueError("REALTIME_ALLOWED_ORIGINS must contain exact HTTP origins")
+            if parsed.port is not None and parsed.port < 1:
+                raise ValueError("REALTIME_ALLOWED_ORIGINS contains an invalid port")
         return self
+
+    @property
+    def realtime_origins(self) -> frozenset[str]:
+        """разобрать список явно разрешённых origin"""
+
+        return frozenset(
+            value.strip() for value in self.realtime_allowed_origins.split(",") if value.strip()
+        )
 
     @property
     def media_upload_body_bytes(self) -> int:

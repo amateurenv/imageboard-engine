@@ -27,7 +27,6 @@ router.include_router(posting_claims_router)
 router.include_router(media_router)
 router.include_router(threads_router)
 router.include_router(posts_router)
-# realtime временно выключен до отдельной безопасной переработки
 # добавляем административные маршруты
 router.include_router(admin_boards_router)
 router.include_router(admin_threads_router)

@@ -34,7 +34,6 @@ from app.schemas.threads import (
 )
 from app.services.posting_claims import PostingClaimError, PostingClaimsService
 from app.services.posting_policy import PostingBoard, check_posting_permission
-from app.ws.manager import WebSocketManager
 
 # паттерн ссылок на посты: >>123
 POST_REFERENCE_PATTERN = re.compile(r">>(\d+)")
@@ -53,13 +52,11 @@ class ThreadsService:
         self,
         repository: ThreadsRepository,
         site_settings: SiteSettings,
-        ws_manager: WebSocketManager,
         posting_claims: PostingClaimsService | None = None,
     ) -> None:
-        # сервис получает репозиторий, настройки сайта и менеджер realtime-событий
+        # сервис получает репозиторий и настройки сайта
         self._repository = repository
         self._site_settings = site_settings
-        self._ws_manager = ws_manager
         self._posting_claims = posting_claims
 
     async def list_threads(
@@ -273,21 +270,10 @@ class ThreadsService:
             if post_create.media_ids
             else {}
         )
-        post_summary = self._to_post_summary(
+        return self._to_post_summary(
             creation_result.post,
             media=media_by_post.get(creation_result.post.id, ()),
         )
-        await self._ws_manager.broadcast(
-            {
-                "event": "post_created",
-                "thread_id": thread_id,
-                "post": post_summary.model_dump(mode="json"),
-            }
-        )
-        if creation_result.was_bumped:
-            await self._ws_manager.broadcast({"event": "thread_bumped", "thread_id": thread_id})
-
-        return post_summary
 
     def _check_subject_length(self, subject: str) -> None:
         """проверить длину заголовка по thread.max_subject_length"""

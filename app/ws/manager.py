@@ -1,163 +1,201 @@
-"""безопасная основа realtime, пока маршруты остаются выключенными"""
+"""локальные подписки и восстановление подписчика redis"""
 
 import asyncio
-import json
-from collections import defaultdict
-from collections.abc import Iterable
-from typing import Any
+import logging
+from dataclasses import dataclass, field
+from typing import Final
 
+from pydantic import ValidationError
 from redis.asyncio import Redis
-from starlette.websockets import WebSocket
+from redis.exceptions import RedisError
 
-# предел на один процесс: не даём одному worker занять всю память соединениями
+from app.schemas.realtime import RealtimeEvent
+
+logger = logging.getLogger(__name__)
+
 MAX_CONNECTIONS = 100
-# клиент может смотреть несколько тредов, но не подписывать сервер на всё сразу
 MAX_SCOPES_PER_CONNECTION = 32
-# событие сообщает об изменении, подробности клиент дочитает через REST
-MAX_EVENT_BYTES = 8 * 1024
-# ping раз в 30 секунд помогает быстрее заметить оборванную сеть
-HEARTBEAT_SECONDS = 30
-EVENTS_CHANNEL = "ws:events"
+MAX_PENDING_MESSAGES = 64
+MAX_EVENT_BYTES = 256
+REDIS_PING_INTERVAL = 5
+REDIS_TIMEOUT = 3
 
 
-def board_scope(slug: str) -> str:
-    """собрать область событий одной доски"""
+@dataclass(frozen=True, slots=True)
+class Close:
+    """код и короткая причина закрытия соединения"""
 
-    return f"board:{slug}"
+    code: int
+    reason: str
 
 
-def thread_scope(thread_id: int) -> str:
-    """собрать область событий одного треда"""
+FEED_UNAVAILABLE: Final = Close(1013, "realtime unavailable")
 
-    return f"thread:{thread_id}"
+
+@dataclass(frozen=True, slots=True)
+class Subscription:
+    """проверенная область, привязанная к стабильному id доски"""
+
+    board_id: int
+    thread_id: int | None
+
+
+@dataclass(eq=False, slots=True)
+class Client:
+    """области, ограниченная очередь и сигнал закрытия одного клиента"""
+
+    subscriptions: dict[str, Subscription] = field(default_factory=dict)
+    messages: asyncio.Queue[dict[str, str]] = field(
+        default_factory=lambda: asyncio.Queue(MAX_PENDING_MESSAGES)
+    )
+    stopped: asyncio.Event = field(default_factory=asyncio.Event)
+    close: Close | None = None
 
 
 class WebSocketManager:
-    """хранить подписки текущего процесса и пересылать события через redis"""
+    """рассылать уведомления локальным подписчикам без ожидания сокета"""
 
-    def __init__(self, redis_client: Redis, max_connections: int = MAX_CONNECTIONS) -> None:
-        self._redis_client = redis_client
+    def __init__(
+        self, redis_client: Redis, channel: str, max_connections: int = MAX_CONNECTIONS
+    ) -> None:
+        self._redis = redis_client
+        self._channel = channel
         self._max_connections = max_connections
-        self._connections: set[WebSocket] = set()
-        self._scopes: dict[str, set[WebSocket]] = defaultdict(set)
-        self._connection_scopes: dict[WebSocket, set[str]] = defaultdict(set)
-        self._stopped = asyncio.Event()
+        self._clients: set[Client] = set()
+        self.ready = asyncio.Event()
+        self.visibility_version = 0
 
-    async def connect(self, websocket: WebSocket) -> bool:
-        """принять соединение, если у процесса есть свободное место"""
+    def connect(self) -> Client | None:
+        """зарезервировать место без ожидания handshake"""
 
-        if len(self._connections) >= self._max_connections:
-            await websocket.close(code=1013, reason="server is busy")
-            return False
-        await websocket.accept()
-        self._connections.add(websocket)
-        return True
+        if not self.ready.is_set() or len(self._clients) >= self._max_connections:
+            return None
+        client = Client()
+        self._clients.add(client)
+        return client
 
-    async def disconnect(self, websocket: WebSocket) -> None:
-        """снять все подписки отключившегося клиента"""
+    def disconnect(self, client: Client) -> None:
+        """освободить соединение после остановки его задач"""
 
-        self._connections.discard(websocket)
-        for scope in self._connection_scopes.pop(websocket, set()):
-            subscribers = self._scopes[scope]
-            subscribers.discard(websocket)
-            if not subscribers:
-                self._scopes.pop(scope, None)
+        self._clients.discard(client)
+        client.subscriptions.clear()
 
-    async def subscribe(self, websocket: WebSocket, scope: str) -> bool:
-        """подписать клиента на одну доску или тред"""
+    def close_client(self, client: Client, close: Close) -> None:
+        """попросить маршрут закрыть сокет и прекратить рассылку клиенту"""
 
-        if not self._is_valid_scope(scope):
-            return False
-        scopes = self._connection_scopes[websocket]
-        if scope not in scopes and len(scopes) >= MAX_SCOPES_PER_CONNECTION:
-            return False
-        scopes.add(scope)
-        self._scopes[scope].add(websocket)
-        return True
+        if client.close is None:
+            client.close = close
+            client.subscriptions.clear()
+            client.stopped.set()
+            logger.info("закрытие realtime клиента, код %d, причина %s", close.code, close.reason)
 
-    async def unsubscribe(self, websocket: WebSocket, scope: str) -> None:
-        """снять одну подписку клиента"""
+    def enqueue(self, client: Client, message: dict[str, str]) -> None:
+        """поставить кадр в очередь или отключить медленного клиента"""
 
-        self._connection_scopes[websocket].discard(scope)
-        subscribers = self._scopes.get(scope)
-        if subscribers is not None:
-            subscribers.discard(websocket)
-            if not subscribers:
-                self._scopes.pop(scope, None)
-
-    async def broadcast(self, event: dict[str, Any], scopes: Iterable[str] = ()) -> None:
-        """отправить событие только подписчикам переданных областей"""
-
-        unique_scopes = sorted(set(scopes))
-        if not unique_scopes:
-            # событие без области нельзя безопасно показать всем посетителям
+        if client.close is not None:
             return
-        payload = json.dumps({"event": event, "scopes": unique_scopes}, ensure_ascii=False)
-        if len(payload.encode("utf-8")) > MAX_EVENT_BYTES:
-            raise ValueError("realtime event is too large")
-        await self._redis_client.publish(EVENTS_CHANNEL, payload)
+        try:
+            client.messages.put_nowait(message)
+        except asyncio.QueueFull:
+            self.close_client(client, Close(1013, "slow client"))
+
+    def deliver(self, event: RealtimeEvent) -> None:
+        """уведомить подписчиков и отозвать области, потерявшие публичный доступ"""
+
+        if event.unavailable:
+            self.visibility_version += 1
+
+        for client in self._clients:
+            for scope, target in tuple(client.subscriptions.items()):
+                if target.board_id != event.board_id:
+                    continue
+                if target.thread_id is not None and event.thread_id not in (
+                    None, target.thread_id
+                ):
+                    continue
+                revoke = event.unavailable and (
+                    event.thread_id is None or target.thread_id is not None
+                )
+                self.enqueue(
+                    client, {"type": "unavailable" if revoke else "changed", "scope": scope}
+                )
+                if revoke:
+                    client.subscriptions.pop(scope, None)
+
+    def _feed_lost(self) -> None:
+        """потребовать новое rest-чтение у клиентов после возможного пропуска"""
+
+        self.ready.clear()
+        self.visibility_version += 1
+        for client in self._clients:
+            self.close_client(client, FEED_UNAVAILABLE)
 
     async def consume_redis(self) -> None:
-        """получать события redis без busy loop до штатной остановки"""
+        """пересоздавать подписку с ограниченной задержкой при сбое"""
 
-        async with self._redis_client.pubsub() as pubsub:
-            await pubsub.subscribe(EVENTS_CHANNEL)
-            while not self._stopped.is_set():
-                message = await pubsub.get_message(
-                    ignore_subscribe_messages=True,
-                    timeout=1.0,
-                )
-                if message is None or message["type"] != "message":
-                    continue
-                await self._deliver(message["data"])
-
-    async def aclose(self) -> None:
-        """остановить consumer и закрыть соединения при shutdown"""
-
-        self._stopped.set()
-        for websocket in tuple(self._connections):
-            await websocket.close(code=1001, reason="server is stopping")
-            await self.disconnect(websocket)
-
-    async def _deliver(self, raw_data: str | bytes) -> None:
-        """разослать событие только локальным подписчикам его областей"""
-
-        data = raw_data.decode("utf-8") if isinstance(raw_data, bytes) else raw_data
+        delay = 0.25
         try:
-            envelope = json.loads(data)
-            scopes = envelope["scopes"]
-        except (json.JSONDecodeError, KeyError, TypeError):
+            while True:
+                try:
+                    await self._listen()
+                except (RedisError, OSError, TimeoutError) as error:
+                    was_ready = self.ready.is_set()
+                    self._feed_lost()
+                    logger.warning("подписка redis realtime потеряна: %s", type(error).__name__)
+                    if was_ready:
+                        delay = 0.25
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 5)
+        finally:
+            self._feed_lost()
+
+    async def _listen(self) -> None:
+        """дождаться подтверждения подписки и проверять ответы redis на ping"""
+
+        loop = asyncio.get_running_loop()
+        async with self._redis.pubsub() as pubsub:
+            await asyncio.wait_for(pubsub.subscribe(self._channel), REDIS_TIMEOUT)
+            subscribed = False
+            awaiting_pong = False
+            deadline = loop.time() + REDIS_TIMEOUT
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    if not subscribed or awaiting_pong:
+                        raise TimeoutError
+                    await asyncio.wait_for(pubsub.ping("realtime"), REDIS_TIMEOUT)
+                    awaiting_pong = True
+                    deadline = loop.time() + REDIS_TIMEOUT
+                    continue
+                message = await asyncio.wait_for(
+                    pubsub.get_message(timeout=remaining), remaining + 0.5
+                )
+                if message is None:
+                    continue
+                if message["type"] == "subscribe":
+                    # redis-py может восстановить подписку внутри get_message
+                    if subscribed:
+                        logger.warning("redis realtime переподписался с возможным пропуском")
+                        self._feed_lost()
+                    subscribed = True
+                    awaiting_pong = False
+                    deadline = loop.time() + REDIS_PING_INTERVAL
+                    self.ready.set()
+                    logger.info("подписка redis realtime подтверждена")
+                elif message["type"] == "pong" and message["data"] == "realtime" and awaiting_pong:
+                    awaiting_pong = False
+                    deadline = loop.time() + REDIS_PING_INTERVAL
+                elif message["type"] == "message" and subscribed:
+                    self._receive_event(message["data"])
+
+    def _receive_event(self, data: object) -> None:
+        """пропустить только короткие уведомления со строгой схемой"""
+
+        if not isinstance(data, (str, bytes)) or len(data) > MAX_EVENT_BYTES:
             return
-        recipients = set().union(*(self._scopes.get(scope, set()) for scope in scopes))
-        for websocket in recipients:
-            try:
-                await websocket.send_text(data)
-            except Exception:
-                # браузер мог исчезнуть между предыдущим сообщением и этим
-                await self.disconnect(websocket)
-
-    @staticmethod
-    def _is_valid_scope(scope: str) -> bool:
-        """принять только короткие области доски или числового треда"""
-
-        if scope.startswith("thread:"):
-            return scope.removeprefix("thread:").isdigit()
-        if scope.startswith("board:"):
-            slug = scope.removeprefix("board:")
-            return 1 <= len(slug) <= 63 and all(
-                char.islower() or char.isdigit() or char in "_-" for char in slug
-            )
-        return False
-
-
-class DisabledWebSocketManager(WebSocketManager):
-    """безопасная заглушка для выключенного realtime"""
-
-    def __init__(self) -> None:
-        """создать заглушку без соединений и redis"""
-
-    async def broadcast(self, event: dict[str, Any], scopes: Iterable[str] = ()) -> None:
-        """не отправлять события, пока realtime выключен"""
-
-    async def aclose(self) -> None:
-        """не закрывать несуществующие соединения"""
+        try:
+            event = RealtimeEvent.model_validate_json(data)
+        except ValidationError:
+            logger.warning("redis realtime вернул событие неверного формата")
+            return
+        self.deliver(event)
