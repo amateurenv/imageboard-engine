@@ -132,7 +132,7 @@ WITH ready AS (
         display_path = $3,
         preview_path = $4,
         canonical_path = $5,
-        canonical_mime_type = CASE WHEN is_animation THEN 'application/x-tgsticker' END,
+        canonical_mime_type = CASE WHEN is_animation THEN mime_type END,
         duration_seconds = $6
     WHERE id = $1 AND processing_state = 'processing' AND media_kind = 'sticker'
       AND processing_lease_until = $2 AND processing_lease_until > clock_timestamp()

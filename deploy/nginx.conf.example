@@ -52,6 +52,18 @@ server {
         limit_except GET HEAD { deny all; }
     }
 
+    location ~ ^/_imageboard_media/stickers/([1-9][0-9]*)\.webm$ {
+        # cache-control приходит от api после проверки видимости
+        internal;
+        alias /srv/imageboard-media/stickers/$1.webm;
+        autoindex off;
+        types {}
+        default_type video/webm;
+        max_ranges 1;
+        add_header X-Content-Type-Options "nosniff" always;
+        limit_except GET HEAD { deny all; }
+    }
+
     # audio derivative также доступен только после FastAPI проверки opaque key
     location ~ ^/_imageboard_media/audio/([1-9][0-9]*)\.m4a$ {
         internal;

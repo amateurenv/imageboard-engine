@@ -34,6 +34,6 @@ class PublicMediaUrls(BaseModel):
     display_url: str | None = None
     content_url: str | None = None
     mime_type: str = "image/webp"
-    # true означает animated WebP display, preview всегда остаётся статичным WebP
+    # true означает анимацию, preview всегда остаётся статичным WebP
     is_animation: bool = False
     duration_seconds: int | None = None

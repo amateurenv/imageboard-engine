@@ -20,6 +20,7 @@ from app.services.media_storage import MediaStorage
 from app.services.sticker_processing import transcode_sticker
 from app.services.tgs_processing import transcode_tgs
 from app.services.video_processing import VIDEO_KINDS, VideoProcessor
+from app.services.video_sticker_processing import WEBM_STICKER_MIME, transcode_video_sticker
 
 # redis будит worker раньше следующей проверки, но postgresql остаётся источником истины
 QUEUE_KEY = "media:previews"
@@ -177,14 +178,22 @@ async def _process_sticker(
     display_path = preview_path = canonical_path = None
     conversion: asyncio.Task[int] | asyncio.Task[None]
     if media.is_animation:
-        canonical_path = f"stickers/{media.id}.tgs"
+        is_webm = media.mime_type == WEBM_STICKER_MIME
+        extension = "webm" if is_webm else "tgs"
+        canonical_path = f"stickers/{media.id}.{extension}"
         preview_path = f"previews/{media.id}.webp"
         canonical = storage.temporary_path(canonical_path)
         preview = storage.temporary_path(preview_path)
         derivatives = [(canonical, canonical_path), (preview, preview_path)]
-        conversion = asyncio.create_task(
-            asyncio.to_thread(transcode_tgs, source, canonical, preview)
-        )
+        if is_webm:
+            settings = get_settings()
+            work = asyncio.to_thread(
+                transcode_video_sticker, source, canonical, preview,
+                ffmpeg_bin=settings.ffmpeg_bin, ffprobe_bin=settings.ffprobe_bin,
+            )
+        else:
+            work = asyncio.to_thread(transcode_tgs, source, canonical, preview)
+        conversion = asyncio.create_task(work)
     else:
         display_path = f"display/{media.id}.webp"
         display = storage.temporary_path(display_path)

@@ -3,15 +3,19 @@
 import asyncio
 import json
 import os
+import shutil
+import socket
 import subprocess
 import uuid
+from contextlib import asynccontextmanager
 from datetime import timedelta
 from io import BytesIO
 from pathlib import Path
 
 import asyncpg
 import pytest
-from httpx import ASGITransport, AsyncClient, Response
+import uvicorn
+from httpx import ASGITransport, AsyncClient, Response, TransportError
 from PIL import Image
 from redis.asyncio import Redis
 
@@ -38,6 +42,7 @@ from app.services.posting_claims import (
 from app.services.sticker_processing import MAX_STICKER_BYTES, STICKER_REPLY_WARNING
 from app.services.tgs_processing import TGS_MIME, canonicalize_tgs
 from app.services.video_processing import VideoProcessor
+from app.services.video_sticker_processing import WEBM_STICKER_MIME
 from app.ws.manager import DisabledWebSocketManager
 from scripts.cleanup_media_files import cleanup_media_files
 from scripts.media_worker import MAX_PROCESSING_ATTEMPTS, PROCESSING_LEASE, process_job
@@ -46,14 +51,82 @@ pytestmark = pytest.mark.integration
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+@asynccontextmanager
+async def nginx_client(nginx: str, root: Path, tmp_path: Path):
+    """пропустить запрос через реальные internal locations шаблона nginx"""
+
+    with socket.socket() as upstream, socket.socket() as address:
+        upstream.bind(("127.0.0.1", 0))
+        upstream.listen()
+        address.bind(("127.0.0.1", 0))
+        port = address.getsockname()[1]
+        address.close()
+
+        template = (PROJECT_ROOT / "deploy/nginx.conf.example").read_text(encoding="utf-8")
+        lines = [
+            line for line in template.splitlines()
+            if not line.strip().startswith(("ssl_certificate", "server_name"))
+        ]
+        server_config = "\n".join(lines).replace(
+            "listen 443 ssl http2;", f"listen 127.0.0.1:{port};",
+        ).replace("/srv/imageboard-media", str(root)).replace(
+            "127.0.0.1:8000", f"127.0.0.1:{upstream.getsockname()[1]}",
+        )
+        config = tmp_path / "nginx.conf"
+        config.write_text(
+            "daemon off;\npid nginx.pid;\nerror_log stderr;\nevents {}\nhttp {\n"
+            "access_log off;\n"
+            "client_body_temp_path body;\nproxy_temp_path proxy;\nfastcgi_temp_path fastcgi;\n"
+            "uwsgi_temp_path uwsgi;\nscgi_temp_path scgi;\n"
+            f"{server_config}\n}}\n", encoding="utf-8",
+        )
+        server = uvicorn.Server(uvicorn.Config(app, lifespan="off", log_level="warning"))
+        task = asyncio.create_task(server.serve(sockets=[upstream]))
+        process = None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                nginx, "-p", str(tmp_path) + "/", "-c", str(config),
+            )
+            async with AsyncClient(base_url=f"http://127.0.0.1:{port}", trust_env=False) as client:
+                for _ in range(100):
+                    if process.returncode is not None:
+                        pytest.fail(f"nginx exited with code {process.returncode}")
+                    try:
+                        if (await client.get("/health", timeout=1)).status_code == 200:
+                            break
+                    except TransportError:
+                        pass
+                    await asyncio.sleep(0.05)
+                else:
+                    pytest.fail("nginx did not start")
+                yield client
+        finally:
+            if process is not None and process.returncode is None:
+                process.terminate()
+                await process.wait()
+            server.should_exit = True
+            await task
+
+
 @pytest.mark.anyio
-@pytest.mark.parametrize("animated", [False, True], ids=["webp", "tgs"])
+@pytest.mark.parametrize(
+    ("extension", "http_client"),
+    [("webp", 23), ("tgs", 23), ("webm", 24), ("webm-nginx", 24)],
+    ids=["webp-upgrade", "tgs-upgrade", "webm", "webm-nginx"], indirect=["http_client"],
+)
 async def test_internal_sticker_publication_visibility_and_cleanup(
     http_client: AsyncClient, monkeypatch: pytest.MonkeyPatch,
-    tgs_payload: bytes, animated: bool,
+    tgs_payload: bytes, extension: str, request: pytest.FixtureRequest, tmp_path: Path,
 ) -> None:
     """проверить одинаковые правила публикации и выдачу производных стикера"""
 
+    nginx = None
+    if extension == "webm-nginx":
+        nginx = shutil.which("nginx")
+        if nginx is None:
+            pytest.skip("Nginx is required")
+        extension = "webm"
+    animated = extension != "webp"
     pool = app.state.postgres_pool
     settings = app.state.site_settings
     users = UsersRepository(pool)
@@ -72,9 +145,12 @@ async def test_internal_sticker_publication_visibility_and_cleanup(
 
     image = BytesIO()
     Image.new("RGBA", (512, 128), (20, 90, 150, 67)).save(image, "WEBP")
-    payload = tgs_payload if animated else image.getvalue()
-    mime = TGS_MIME if animated else "image/webp"
-    filename = "sticker.tgs" if animated else "sticker.webp"
+    payload, mime = image.getvalue(), "image/webp"
+    if extension == "tgs":
+        payload, mime = tgs_payload, TGS_MIME
+    elif extension == "webm":
+        payload, mime = request.getfixturevalue("webm_payload"), WEBM_STICKER_MIME
+    filename = f"sticker.{extension}"
     storage = MediaStorage(app.state.media_storage_root)
     upload = MediaUploadService(pool, app.state.redis_client, settings, storage.root)
     posting = PostingClaimsService(pool, settings)
@@ -89,6 +165,13 @@ async def test_internal_sticker_publication_visibility_and_cleanup(
     with pytest.raises(MediaPolicyError) as invalid:
         await upload.stage_sticker(thread_id=thread_id, actor=author, data=image_bytes("WEBP"))
     assert invalid.value.code.value == "invalid_media"
+    if extension == "webm":
+        with pytest.raises(MediaPolicyError) as invalid:
+            await upload.stage_sticker(thread_id=thread_id, actor=author, data=payload[:-1])
+        assert invalid.value.code.value == "invalid_media"
+        assert await pool.fetchval("SELECT count(*) FROM posting_claims") == 0
+        assert await pool.fetchval("SELECT count(*) FROM media") == 0
+        assert not [file for file in storage.root.rglob("*") if file.is_file()]
 
     token, queued = await upload.stage_sticker(thread_id=thread_id, actor=author, data=payload)
     assert queued.media_kind == "sticker" and queued.processing_state.value == "queued"
@@ -105,22 +188,35 @@ async def test_internal_sticker_publication_visibility_and_cleanup(
     await process_job(repository, queued.id, storage, expected_lease=claimed.processing_lease_until)
     ready = await repository.get_by_id(queued.id)
     assert ready is not None and ready.processing_state.value == "ready"
+    if extension in {"webp", "tgs"}:
+        # обновляем схему, когда производные старого формата уже готовы к публикации
+        migration = PROJECT_ROOT / "migrations/024_video_stickers.sql"
+        await pool.execute(migration.read_text(encoding="utf-8"))
+        assert await repository.get_by_id(queued.id) == ready
     if animated:
         assert ready.preview_path == f"previews/{queued.id}.webp" and ready.display_path is None
-        assert ready.canonical_path == f"stickers/{queued.id}.tgs" and ready.duration_seconds == 2
+        assert ready.canonical_path == f"stickers/{queued.id}.{extension}"
+        assert ready.duration_seconds == 2 and ready.canonical_mime_type == mime
+        assert ready.channels is None and ready.sample_rate is None
         canonical = storage.resolve(ready.canonical_path)
-        assert canonical.read_bytes() == canonicalize_tgs(payload)[1]
+        if extension == "tgs":
+            assert canonical.read_bytes() == canonicalize_tgs(payload)[1]
+        else:
+            assert canonical.read_bytes() != payload and canonical.stat().st_size <= 256 * 1024
         webp = storage.resolve(ready.preview_path)
     else:
         assert ready.display_path == f"display/{queued.id}.webp" and ready.preview_path is None
         webp = canonical = storage.resolve(ready.display_path)
     with Image.open(webp) as rendered:
         assert rendered.format == "WEBP" and rendered.n_frames == 1
-        assert rendered.size == ((512, 512) if animated else (512, 128))
-        if animated:
+        assert rendered.size == ((512, 512) if extension == "tgs" else (512, 128))
+        if extension == "tgs":
             assert rendered.getpixel((1, 1))[3] == 0
             red, green, blue, alpha = rendered.getpixel((256, 256))
             assert red > 230 and green < 15 and blue < 15 and 126 <= alpha <= 128
+        elif extension == "webm":
+            assert rendered.getpixel((1, 1))[3] == 0
+            assert 120 <= rendered.getpixel((60, 50))[3] <= 130
         else:
             assert rendered.getpixel((1, 1))[3] == 67
         assert webp.stat().st_size <= MAX_STICKER_BYTES
@@ -145,7 +241,10 @@ async def test_internal_sticker_publication_visibility_and_cleanup(
         media_url, data={"posting_claim_token": normal_token, "media_kind": "sticker"},
         files={"file": (filename, payload, mime)},
     )
-    if animated:
+    if extension == "webm":
+        assert ordinary.status_code == 415
+        assert ordinary.json()["detail"]["code"] == "unsupported_media_type"
+    elif animated:
         assert ordinary.status_code in {415, 422} and ordinary.json()["detail"]["code"] in {
             "unsupported_media_type", "invalid_media",
         }
@@ -208,7 +307,7 @@ async def test_internal_sticker_publication_visibility_and_cleanup(
     if animated:
         assert item["display_url"] is None and item["duration_seconds"] == 2
         assets = {
-            "content": (TGS_MIME, f"{prefix}/stickers/{queued.id}.tgs"),
+            "content": (mime, f"{prefix}/stickers/{queued.id}.{extension}"),
             "preview": ("image/webp", f"{prefix}/sticker-previews/{queued.id}.webp"),
         }
         unavailable = ("display",)
@@ -227,20 +326,47 @@ async def test_internal_sticker_publication_visibility_and_cleanup(
     base_url = item[f"{next(iter(assets))}_url"].rsplit("/", 1)[0]
     for kind in unavailable:
         assert (await http_client.get(f"{base_url}/{kind}")).status_code == 404
-    hidden = await http_client.patch(moderation_url, headers=csrf, json={"is_hidden": True})
-    assert hidden.status_code == 200
+    if nginx is not None:
+        async with nginx_client(nginx, storage.root, tmp_path) as proxy:
+            for kind, file in (("content", canonical), ("preview", webp)):
+                url = item[f"{kind}_url"]
+                for method in ("GET", "HEAD"):
+                    response = await proxy.request(method, url)
+                    assert response.status_code == 200
+                    assert response.content == (file.read_bytes() if method == "GET" else b"")
+                    assert response.headers["content-type"] == assets[kind][0]
+                    assert response.headers["cache-control"] == "no-store"
+                    assert response.headers["x-content-type-options"] == "nosniff"
+                assert (await proxy.get(assets[kind][1])).status_code == 404
+            partial = await proxy.get(item["content_url"], headers={"Range": "bytes=0-15"})
+            assert partial.status_code == 206 and partial.content == canonical.read_bytes()[:16]
+            assert partial.headers["content-range"] == f"bytes 0-15/{canonical.stat().st_size}"
+            assert partial.headers["cache-control"] == "no-store"
+            invalid_range = await proxy.get(item["content_url"], headers={"Range": "bytes=999999-"})
+            assert invalid_range.status_code == 416
+            hidden = await http_client.patch(moderation_url, headers=csrf, json={"is_hidden": True})
+            assert hidden.status_code == 200
+            for kind in assets:
+                assert (await proxy.get(item[f"{kind}_url"])).status_code == 404
+            assert (await http_client.delete(moderation_url, headers=csrf)).status_code == 204
+            for kind in assets:
+                assert (await proxy.head(item[f"{kind}_url"])).status_code == 404
+    else:
+        hidden = await http_client.patch(moderation_url, headers=csrf, json={"is_hidden": True})
+        assert hidden.status_code == 200
     for kind in assets:
         assert (await http_client.get(item[f"{kind}_url"])).status_code == 404
-    assert (await http_client.delete(moderation_url, headers=csrf)).status_code == 204
+    if nginx is None:
+        assert (await http_client.delete(moderation_url, headers=csrf)).status_code == 204
     assert await cleanup_media_files(repository=repository, storage=storage) == len(assets)
     assert not canonical.exists() and not webp.exists()
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("animated", [False, True], ids=["webp", "tgs"])
+@pytest.mark.parametrize("extension", ["webp", "tgs", "webm"])
 async def test_sticker_worker_replace_failure_keeps_quarantine_until_claim_expires(
     http_client: AsyncClient, monkeypatch: pytest.MonkeyPatch,
-    tgs_payload: bytes, animated: bool,
+    tgs_payload: bytes, extension: str, request: pytest.FixtureRequest,
 ) -> None:
     """проверить откат готовности при файловой ошибке и очистку истёкшего claim"""
 
@@ -255,9 +381,12 @@ async def test_sticker_worker_replace_failure_keeps_quarantine_until_claim_expir
     upload = MediaUploadService(pool, app.state.redis_client, app.state.site_settings, storage.root)
     image = BytesIO()
     Image.new("RGBA", (240, 512), (0, 0, 0, 0)).save(image, "WEBP", lossless=True)
+    payload = tgs_payload if extension == "tgs" else image.getvalue()
+    if extension == "webm":
+        payload = request.getfixturevalue("webm_payload")
     _, queued = await upload.stage_sticker(
         thread_id=thread.json()["thread"]["id"], actor=actor,
-        data=tgs_payload if animated else image.getvalue(),
+        data=payload,
     )
     repository = MediaRepository(pool)
     claimed = await repository.claim_by_id(
@@ -268,7 +397,7 @@ async def test_sticker_worker_replace_failure_keeps_quarantine_until_claim_expir
     replace = storage.replace_from_temporary
 
     def reject_replace(temporary: Path, relative_path: str) -> Path:
-        if relative_path.endswith(".tgs"):
+        if relative_path.startswith("stickers/"):
             return replace(temporary, relative_path)
         raise OSError("simulated storage failure")
 
@@ -282,8 +411,16 @@ async def test_sticker_worker_replace_failure_keeps_quarantine_until_claim_expir
     assert (media.display_path, media.canonical_path, media.preview_path) == (None, None, None)
     assert list(storage.root.rglob("*.*")) == [storage.resolve(media.path)]
     assert await cleanup_media_files(repository=repository, storage=storage) == 0
-    await process_job(repository, queued.id, storage, expected_lease=claimed.processing_lease_until)
-    path = f"stickers/{queued.id}.tgs" if animated else f"display/{queued.id}.webp"
+    animated = extension != "webp"
+    path = f"stickers/{queued.id}.{extension}" if animated else f"display/{queued.id}.webp"
+    if extension == "webm":
+        # имитируем остановку worker после replace, когда пути ещё отсутствуют в базе
+        for derivative in (path, f"previews/{queued.id}.webp"):
+            storage.resolve(derivative).write_bytes(b"interrupted worker")
+    else:
+        await process_job(
+            repository, queued.id, storage, expected_lease=claimed.processing_lease_until,
+        )
     assert storage.resolve(path).is_file()
 
     await pool.execute(
@@ -298,7 +435,7 @@ async def test_sticker_worker_replace_failure_keeps_quarantine_until_claim_expir
 
 
 @pytest.fixture
-async def http_client(tmp_path: Path) -> AsyncClient:
+async def http_client(tmp_path: Path, request: pytest.FixtureRequest) -> AsyncClient:
     """дать api отдельные postgres-схему и redis database"""
 
     database_url = os.getenv("TEST_DATABASE_URL")
@@ -316,7 +453,10 @@ async def http_client(tmp_path: Path) -> AsyncClient:
         await redis.delete(*stale_keys)
     await connection.execute(f'CREATE SCHEMA "{schema}"')
     await connection.execute(f'SET search_path TO "{schema}"')
+    max_migration = getattr(request, "param", None)
     for migration in sorted((PROJECT_ROOT / "migrations").glob("*.sql")):
+        if max_migration is not None and int(migration.name.split("_", 1)[0]) > max_migration:
+            break
         await connection.execute(migration.read_text(encoding="utf-8"))
 
     pool = await asyncpg.create_pool(database_url, server_settings={"search_path": schema})

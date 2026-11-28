@@ -39,7 +39,7 @@ jobs:
           python-version: "3.14"
 
       - name: Install media dependencies
-        run: sudo apt-get update && sudo apt-get install --yes ffmpeg librlottie0-1 util-linux
+        run: sudo apt-get update && sudo apt-get install --yes ffmpeg librlottie0-1 util-linux nginx
 
       - name: Install dependencies
         run: |

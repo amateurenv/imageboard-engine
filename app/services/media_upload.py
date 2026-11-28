@@ -11,6 +11,7 @@ from asyncpg import Pool
 from fastapi import UploadFile
 from redis.asyncio import Redis
 
+from app.core.config import get_settings
 from app.core.security import hash_token
 from app.core.site_settings import SiteSettings
 from app.repositories.media import MediaRecord, MediaRepository
@@ -39,6 +40,12 @@ from app.services.posting_policy import (
 from app.services.sticker_processing import STICKER_MIME, decode_sticker
 from app.services.tgs_processing import TGS_MIME, canonicalize_tgs
 from app.services.video_processing import VIDEO_MIME, VideoProcessor, looks_like_mp4_video
+from app.services.video_sticker_processing import (
+    EBML_SIGNATURE,
+    WEBM_STICKER_MIME,
+    check_webm_sticker_size,
+    inspect_video_sticker,
+)
 
 # потоковая запись ограничивает память одного запроса даже для заявленного большого файла
 UPLOAD_CHUNK_SIZE = 1024 * 1024
@@ -189,15 +196,19 @@ class MediaUploadService:
 
         if thread_id is None:
             raise StickerCannotStartThread()
-        is_animation = data.startswith(b"\x1f\x8b")
-        if is_animation:
+        if data.startswith(EBML_SIGNATURE):
+            check_webm_sticker_size(len(data))
+            mime_type = WEBM_STICKER_MIME
+        elif data.startswith(b"\x1f\x8b"):
             await asyncio.to_thread(canonicalize_tgs, data)
+            mime_type = TGS_MIME
         else:
             image = await asyncio.to_thread(decode_sticker, data)
             image.close()
+            mime_type = STICKER_MIME
         token = secrets.token_urlsafe(32)
         staging = asyncio.create_task(self._store_sticker(
-            thread_id, actor, token, data, is_animation=is_animation,
+            thread_id, actor, token, data, mime_type=mime_type,
         ))
         try:
             media = await asyncio.shield(staging)
@@ -209,12 +220,22 @@ class MediaUploadService:
         return token, media
 
     async def _store_sticker(
-        self, thread_id: int, actor: UserRecord, token: str, data: bytes, *, is_animation: bool,
+        self, thread_id: int, actor: UserRecord, token: str, data: bytes, *, mime_type: str,
     ) -> MediaRecord:
         """сохранить закрытый claim и задачу обработки с общим commit"""
 
         path: str | None = None
         try:
+            relative_path = self._storage.new_quarantine_path(".upload")
+            descriptor, source = self._storage.open_new(relative_path)
+            path = relative_path
+            with open(descriptor, "wb", closefd=True) as target:
+                target.write(data)
+            if mime_type == WEBM_STICKER_MIME:
+                # ffprobe работает до блокировки доски и треда
+                await asyncio.to_thread(
+                    inspect_video_sticker, source, ffprobe_bin=get_settings().ffprobe_bin,
+                )
             async with self._pool.acquire() as connection:
                 async with connection.transaction():
                     board = await self._claims.lock_sticker_target(connection, thread_id)
@@ -227,16 +248,11 @@ class MediaUploadService:
                         connection, board.id, thread_id, actor.id, hash_token(token),
                         timedelta(minutes=self._settings.posting_claims.ttl_minutes),
                     )
-                    relative_path = self._storage.new_quarantine_path(".upload")
-                    descriptor, _ = self._storage.open_new(relative_path)
-                    path = relative_path
-                    with open(descriptor, "wb", closefd=True) as target:
-                        target.write(data)
                     media = await self._media.create_in_transaction(
                         connection, path=path, size=len(data),
-                        mime_type=TGS_MIME if is_animation else STICKER_MIME,
+                        mime_type=mime_type,
                         board_id=board.id, posting_claim_id=claim_id,
-                        is_animation=is_animation, media_kind=MediaType.STICKER.value,
+                        is_animation=mime_type != STICKER_MIME, media_kind=MediaType.STICKER.value,
                     )
         except Exception:
             if path is not None:

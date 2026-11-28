@@ -2,8 +2,12 @@
 
 import gzip
 import json
+import shutil
+import subprocess
+from pathlib import Path
 
 import pytest
+from PIL import Image, ImageDraw
 
 
 @pytest.fixture
@@ -37,3 +41,29 @@ def tgs_document() -> dict:
 @pytest.fixture
 def tgs_payload(tgs_document: dict) -> bytes:
     return gzip.compress(json.dumps(tgs_document).encode("utf-8"), mtime=12345)
+
+
+@pytest.fixture
+def webm_payload(tmp_path: Path) -> bytes:
+    """закодировать движение полупрозрачной фигуры на прозрачном фоне"""
+
+    if not all(shutil.which(binary) for binary in ("ffmpeg", "ffprobe", "/usr/bin/prlimit")):
+        pytest.skip("FFmpeg, FFprobe and /usr/bin/prlimit are required")
+    frames = []
+    for index in range(24):
+        image = Image.new("RGBA", (512, 128))
+        ImageDraw.Draw(image).rectangle((40 + index * 4, 20, 80 + index * 4, 100), fill=(
+            255, 0, 0, 125,
+        ))
+        frames.append(image.tobytes())
+    output = tmp_path / "input-sticker.webm"
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pixel_format", "rgba",
+            "-video_size", "512x128", "-framerate", "12", "-i", "pipe:0",
+            "-metadata", "title=discard this metadata", "-c:v", "libvpx-vp9",
+            "-pix_fmt", "yuva420p", "-threads:v", "2", "-lossless", "1", str(output),
+        ],
+        input=b"".join(frames), check=True, timeout=20,
+    )
+    return output.read_bytes()

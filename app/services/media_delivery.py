@@ -6,8 +6,10 @@ from typing import Protocol
 
 from app.repositories.media_delivery import DeliverableMedia, MediaDeliveryRepository
 from app.repositories.users import UserRecord
+from app.services.sticker_processing import STICKER_MIME
 from app.services.tgs_processing import TGS_MIME
 from app.services.video_processing import VIDEO_KINDS, VIDEO_MIME
+from app.services.video_sticker_processing import WEBM_STICKER_MIME
 
 INTERNAL_ACCEL_PREFIX = "/_imageboard_media"
 PUBLIC_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
@@ -88,24 +90,30 @@ class MediaDeliveryService:
             return None
         if media.media_kind == "sticker":
             # все производные стикеров повторно проверяют видимость после модерации
-            if media.mime_type == TGS_MIME:
-                canonical = f"stickers/{media.id}.tgs"
+            if media.mime_type in {TGS_MIME, WEBM_STICKER_MIME}:
+                extension = "webm" if media.mime_type == WEBM_STICKER_MIME else "tgs"
+                canonical = f"stickers/{media.id}.{extension}"
                 preview = f"previews/{media.id}.webp"
                 if (
-                    media.canonical_path != canonical or media.canonical_mime_type != TGS_MIME
+                    media.canonical_path != canonical
+                    or media.canonical_mime_type != media.mime_type
                     or media.preview_path != preview
                 ):
                     return None
                 if asset_kind == "content":
                     return MediaDelivery(
-                        TGS_MIME, f"{INTERNAL_ACCEL_PREFIX}/{canonical}", cache_control="no-store",
+                        media.mime_type, f"{INTERNAL_ACCEL_PREFIX}/{canonical}",
+                        cache_control="no-store",
                     )
                 if asset_kind == "preview":
                     return MediaDelivery(
                         "image/webp", f"{INTERNAL_ACCEL_PREFIX}/sticker-{preview}",
                         cache_control="no-store",
                     )
-            elif asset_kind == "display" and media.display_path == f"display/{media.id}.webp":
+            elif (
+                media.mime_type == STICKER_MIME and asset_kind == "display"
+                and media.display_path == f"display/{media.id}.webp"
+            ):
                 return MediaDelivery(
                     "image/webp", f"{INTERNAL_ACCEL_PREFIX}/stickers/{media.id}.webp",
                     cache_control="no-store",
