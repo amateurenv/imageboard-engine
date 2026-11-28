@@ -1040,6 +1040,53 @@ async def test_moderator_cannot_create_board_but_can_read_admin_list(
 
 
 @pytest.mark.anyio
+async def test_admin_appearance_write_preserves_legacy_settings(http_client: AsyncClient) -> None:
+    """изменить безопасные цвета и сохранить ранее записанные поля оформления"""
+
+    endpoint = "/api/v1/admin/settings"
+    current = app.state.site_settings.appearance
+    current.active_theme = "legacy"
+    current.logo_path = "originals/logo.png"
+    current.style_vars = {"--legacy-color": "blue"}
+
+    csrf = await login(http_client, "owner", "owner-password")
+    settings = (await http_client.get(endpoint)).json()
+    appearance = settings["appearance"]
+    settings["site"]["title"] = "Проверка настроек"
+    assert (await http_client.put(endpoint, json=settings)).status_code == 403
+
+    for field, value, code in [
+        ("active_theme", "custom", "invalid_appearance_theme"),
+        ("logo_path", "other/logo.png", "appearance_paths_read_only"),
+        ("style_vars", {"--unknown-color": "#112233"}, "invalid_appearance_color"),
+        ("style_vars", {"--accent-color": "red"}, "invalid_appearance_color"),
+    ]:
+        rejected = await http_client.put(
+            endpoint,
+            headers=csrf,
+            json={**settings, "appearance": {**appearance, field: value}},
+        )
+        assert rejected.status_code == 422
+        assert rejected.json()["detail"] == code
+
+    saved = await http_client.put(endpoint, headers=csrf, json=settings)
+    assert saved.status_code == 200
+    assert saved.json()["appearance"] == appearance
+
+    appearance["active_theme"] = "light"
+    appearance["style_vars"]["--accent-color"] = "#112233"
+    saved = await http_client.put(endpoint, headers=csrf, json=settings)
+    assert saved.status_code == 200
+    assert (await http_client.get(endpoint)).json() == saved.json()
+    assert saved.json()["site"]["title"] == "Проверка настроек"
+    assert saved.json()["appearance"] == appearance
+
+    csrf = await login(http_client, "moderator", "moderator-password")
+    assert (await http_client.get(endpoint)).status_code == 403
+    assert (await http_client.put(endpoint, headers=csrf, json=settings)).status_code == 403
+
+
+@pytest.mark.anyio
 async def test_profile_registration_policy_moderation_and_urls(http_client: AsyncClient) -> None:
     """profile проходит регистрацию, policy, csrf и audit через настоящие сервисы"""
 

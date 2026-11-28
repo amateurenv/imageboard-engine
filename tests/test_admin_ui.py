@@ -20,3 +20,6 @@ async def test_admin_page_is_available_without_api_schema() -> None:
     assert "csrf_token" in response.text
     assert "Создать доску" in response.text
     assert "Сохранить изменения" in response.text
+    assert "Модерация" in response.text
+    assert "IP-баны" in response.text
+    assert "Предпросмотр оформления" in response.text

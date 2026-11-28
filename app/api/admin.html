@@ -1,0 +1,654 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Imageboard - управление</title>
+<style>
+  body { max-width: 880px; margin: 2rem auto; padding: 0 1rem; font: 16px system-ui; }
+  section, details { border: 1px solid #bbb; border-radius: .5rem; padding: 1rem; margin: 1rem 0; }
+  h2, h3 { margin-top: 0; }
+  form, .fields { display: grid; gap: .65rem; }
+  .row { display: flex; flex-wrap: wrap; gap: .65rem; align-items: end; }
+  label { display: grid; gap: .2rem; }
+  .check { display: flex; align-items: center; }
+  input, button, select, textarea { font: inherit; padding: .35rem; max-width: 100%; box-sizing: border-box; }
+  textarea { width: 100%; resize: vertical; }
+  [hidden] { display: none !important; }
+  .danger, .error { color: #a00; }
+  li { margin: .5rem 0; overflow-wrap: anywhere; }
+  li p { white-space: pre-wrap; }
+  #status { min-height: 1.5rem; }
+  #preview { overflow-wrap: anywhere; }
+  #preview strong { border-inline-start: .3rem solid var(--preview-accent); padding-inline-start: .5rem; }
+</style>
+<body>
+<h1>Управление</h1>
+<p id="status" role="status">Проверяем сессию…</p>
+<section id="login-box" hidden>
+  <h2>Вход</h2>
+  <form id="login-form">
+    <label>Логин <input name="login" autocomplete="username" required></label>
+    <label>Пароль <input name="password" type="password" autocomplete="current-password" required></label>
+    <div><button>Войти</button></div>
+  </form>
+</section>
+<section id="nonstaff-box" hidden>
+  <button id="nonstaff-logout" type="button">Выйти из текущей учётной записи</button>
+</section>
+<main id="panel" hidden>
+  <p class="row"><strong id="user"></strong><button id="logout" type="button">Выйти</button></p>
+  <section>
+    <h2>Доски</h2>
+    <div class="row">
+      <label>Доска <select id="board-select"></select></label>
+      <button id="load-boards" type="button">Обновить список</button>
+      <button id="new-board" type="button" hidden>Новая доска</button>
+    </div>
+    <p id="board-info"></p>
+    <form id="board-form" hidden>
+      <div class="row">
+        <label>Slug <input name="slug" required pattern="[a-z0-9][a-z0-9_\-]*" maxlength="63"></label>
+        <label>Название <input name="title" required maxlength="1000"></label>
+        <label>Позиция <input name="position" type="number" required></label>
+      </div>
+      <label>Описание <textarea name="description" rows="2" maxlength="10000"></textarea></label>
+      <div class="row">
+        <label class="check"><input name="is_active" type="checkbox"> Активна</label>
+        <label class="check"><input name="is_nsfw" type="checkbox"> 18+</label>
+      </div>
+      <details>
+        <summary>Медиаполитика доски</summary>
+        <p>Пустые значения наследуют настройки сайта. Жёсткие ограничения форматов действуют всегда.</p>
+        <div class="fields" id="board-media"></div>
+        <p id="media-warning"></p>
+        <button id="reset-media" type="button">Наследовать все параметры</button>
+      </details>
+      <div class="row">
+        <button id="save-board">Создать доску</button>
+        <button id="delete-board" type="button" class="danger" hidden>Удалить доску</button>
+      </div>
+    </form>
+  </section>
+  <section>
+    <h2>Модерация</h2>
+    <button id="load-threads" type="button">Загрузить треды выбранной доски</button>
+    <ul id="thread-list"></ul>
+    <button id="more-threads" type="button" hidden>Ещё треды</button>
+    <details>
+      <summary>Действие по внутреннему ID</summary>
+      <p>Используйте известный внутренний ID из API. Публичный список показывает доступный контент.</p>
+      <form id="lookup-thread">
+        <label>ID треда <input name="id" inputmode="numeric" pattern="[1-9][0-9]*" required></label>
+        <div><button>Открыть тред</button> <button id="edit-by-id" type="button">Модерировать по ID</button></div>
+      </form>
+      <form id="delete-by-id">
+        <label>ID ответа <input name="id" inputmode="numeric" pattern="[1-9][0-9]*" required></label>
+        <div><button class="danger">Удалить ответ</button></div>
+      </form>
+    </details>
+    <section id="thread-box" hidden>
+      <h3 id="thread-title"></h3>
+      <form id="thread-form">
+        <label>Заголовок <input name="subject" maxlength="1000"></label>
+        <div class="row" id="thread-flags"></div>
+        <div class="row">
+          <button>Сохранить тред</button>
+          <button id="delete-thread" type="button" class="danger">Удалить тред</button>
+        </div>
+      </form>
+      <div id="thread-posts" hidden>
+        <h4>Первый пост</h4>
+        <ul id="op"></ul>
+        <h4>Ответы</h4>
+        <button id="more-replies" type="button" hidden>Загрузить более ранние ответы</button>
+        <ul id="replies"></ul>
+      </div>
+    </section>
+  </section>
+  <section>
+    <h2>IP-баны</h2>
+    <button id="load-bans" type="button">Загрузить список</button>
+    <ul id="bans"></ul>
+    <form id="ban-form">
+      <div class="row">
+        <label>IPv4 или IPv6 <input name="ip" required></label>
+        <label>Причина <input name="reason" maxlength="500"></label>
+        <button>Добавить бан</button>
+      </div>
+    </form>
+  </section>
+  <section id="settings-section" hidden>
+    <h2>Настройки сайта</h2>
+    <button id="load-settings" type="button">Загрузить настройки</button>
+    <form id="settings-form" hidden>
+      <div id="settings-fields"></div>
+      <div><button>Сохранить настройки</button></div>
+    </form>
+  </section>
+</main>
+<script>
+const get = id => document.getElementById(id);
+const panel = get('panel');
+const login = get('login-box');
+const boardForm = get('board-form');
+const threadForm = get('thread-form');
+const settingsForm = get('settings-form');
+const statusLine = get('status');
+const boardSelect = get('board-select');
+const flags = {is_sticky: 'Закрепление', is_locked: 'Блокировка', is_archived: 'Архивация'};
+const mediaFields = {
+  max_attachments_per_post: ['Вложений на пост', 1, 20],
+  max_attachment_size_mib: ['Размер вложения, МиБ', 1, 100],
+  max_total_size_mib: ['Суммарный размер, МиБ', 1, 500],
+  uploads_enabled: ['Загрузки', 'bool'],
+  allow_anonymous_uploads: ['Анонимные загрузки', 'bool'],
+};
+const settingsGroups = [
+  ['site', 'Сайт', {title: ['Название', 'text', 200], description: ['Описание', 'area', 1000], rules: ['Правила', 'area', 5000]}],
+  ['localization', 'Локализация', {default_locale: ['Локаль', 'text', 5], anonymous_name: ['Имя анонима', 'text', 500]}],
+  ['thread', 'Треды', {
+    max_subject_length: ['Длина заголовка', 0, 1000],
+    max_threads_per_board_day: ['Тредов на доску в сутки', 0, 1000],
+  }],
+  ['post', 'Посты', {
+    max_post_length: ['Длина поста', 1, 100000],
+    max_author_name_length: ['Длина имени автора', 0, 500],
+    max_posts_per_thread_hour: ['Ответов в тред в час', 0, 10000],
+  }],
+  ['identifiers', 'Идентификаторы', {
+    board_slug_min_length: ['Минимальная длина slug', 1, 63],
+    board_slug_max_length: ['Максимальная длина slug', 1, 63],
+    profile_handle_min_length: ['Минимальная длина handle', 1, 63],
+    profile_handle_max_length: ['Максимальная длина handle', 1, 63],
+  }],
+  ['statistics', 'Статистика', {activity_window_hours: ['Окно активности, часы', 1, 168]}],
+  ['posting_claims', 'Claims для вложений', {ttl_minutes: ['Время действия, минуты', 1, 120]}],
+  ['media', 'Медиаполитика сайта', mediaFields],
+];
+const themes = {
+  light: {label: 'Светлая', colors: ['#165baa', '#f5f5f5', '#202020']},
+  dark: {label: 'Тёмная', colors: ['#85b8ff', '#222222', '#f2f2f2']},
+};
+const colors = {
+  '--accent-color': 'Акцент',
+  '--surface-color': 'Фон',
+  '--text-color': 'Текст',
+};
+let boards = [];
+let editingBoard = '';
+let threadCursor = null;
+let replyCursor = null;
+let activeThread = '';
+let canEditBoards = false;
+let busy = false;
+
+const errors = {
+  'invalid login or password': 'Неверный логин или пароль.',
+  'opening post must be removed with its thread': 'Первый пост удаляется вместе с тредом.',
+  'ip is already banned': 'Этот IP уже заблокирован.',
+  'csrf validation failed': 'Сессия формы устарела. Обновите страницу.',
+  invalid_appearance_theme: 'Выберите встроенную тему.',
+  invalid_appearance_color: 'Используйте цвет в формате #RRGGBB.',
+  appearance_paths_read_only: 'Пути оформления доступны только для чтения.',
+};
+const statusErrors = {
+  401: 'Войдите снова.',
+  403: 'Недостаточно прав для этого действия.',
+  404: 'Объект отсутствует или недоступен.',
+  409: 'Действие конфликтует с текущим состоянием.',
+  422: 'Проверьте значения в форме.',
+  429: 'Слишком много запросов. Попробуйте позже.',
+};
+
+function show(message, error = false) {
+  statusLine.textContent = message;
+  statusLine.classList.toggle('error', error);
+}
+
+async function request(path, method = 'GET', data) {
+  const headers = new Headers();
+  if (method !== 'GET' && path !== '/auth/login') {
+    const token = document.cookie.split('; ').find(item => item.startsWith('csrf_token='));
+    headers.set('X-CSRF-Token', token?.slice('csrf_token='.length) || '');
+  }
+  if (data !== undefined) headers.set('Content-Type', 'application/json');
+  let response;
+  try {
+    response = await fetch('/api/v1' + path, {
+      method, headers, credentials: 'same-origin', body: JSON.stringify(data),
+    });
+  } catch {
+    throw new Error('Не удалось связаться с сервером.');
+  }
+  if (response.ok) return response.status === 204 ? null : response.json();
+  const {detail} = await response.json().catch(() => ({}));
+  if (response.status === 401 && path !== '/auth/login') {
+    panel.hidden = true;
+    settingsForm.hidden = true;
+    get('settings-fields').replaceChildren();
+    get('nonstaff-box').hidden = true;
+    login.hidden = false;
+  }
+  const detailMessage = typeof detail === 'string' ? detail : detail?.message;
+  const knownError = Object.hasOwn(errors, detailMessage) ? errors[detailMessage] : '';
+  const summary = knownError || statusErrors[response.status] || `Ошибка сервера (${response.status}).`;
+  const description = Array.isArray(detail)
+    ? detail.map(issue => `${issue.loc.slice(1).join('.')} — ${issue.msg}`).join(' ')
+    : detailMessage;
+  throw new Error([summary, !knownError && response.status !== 401 ? description : ''].filter(Boolean).join(' '));
+}
+
+function action(task, message) {
+  return async event => {
+    event?.preventDefault();
+    if (busy) return;
+    busy = true;
+    const focus = document.activeElement;
+    for (const box of [panel, login, get('nonstaff-box')]) box.inert = true;
+    try {
+      const result = await task(event);
+      if (result !== false && message) show(message);
+    } catch (error) {
+      show(error.message, true);
+    } finally {
+      for (const box of [panel, login, get('nonstaff-box')]) box.inert = false;
+      if (document.activeElement === document.body) focus?.focus();
+      busy = false;
+    }
+  };
+}
+
+async function refreshAfterWrite(refresh) {
+  try {
+    await refresh();
+    return true;
+  } catch (error) {
+    show(`Изменение применено. Обновите список. ${error.message}`, true);
+    return false;
+  }
+}
+
+function element(tag, text = '') {
+  const node = document.createElement(tag);
+  node.textContent = text;
+  return node;
+}
+
+function option(value, text) {
+  const item = element('option', text);
+  item.value = value;
+  return item;
+}
+
+function field(name, [caption, kind, max], value, emptyLabel = '') {
+  const label = element('label', caption);
+  let control;
+  if (kind === 'bool') {
+    control = element('select');
+    if (emptyLabel) control.append(option('', emptyLabel));
+    control.append(option('true', 'Включено'), option('false', 'Выключено'));
+  } else if (kind === 'area') {
+    control = element('textarea');
+    control.rows = 3;
+    control.maxLength = max;
+  } else {
+    control = element('input');
+    if (typeof kind === 'number') {
+      control.type = 'number';
+      control.min = kind;
+      control.max = max;
+      control.required = !emptyLabel;
+      control.placeholder = emptyLabel;
+    } else if (kind === 'color') {
+      control.pattern = '#[0-9a-fA-F]{6}';
+      control.placeholder = '#RRGGBB или пусто';
+    } else {
+      control.maxLength = max;
+    }
+  }
+  control.name = name;
+  control.value = value ?? '';
+  label.append(control);
+  return label;
+}
+
+function readField(control, kind) {
+  if (typeof kind === 'number') return control.value === '' ? null : control.valueAsNumber;
+  if (kind === 'bool') return control.value === '' ? null : control.value === 'true';
+  return control.value;
+}
+
+function clearModeration() {
+  get('thread-list').replaceChildren();
+  get('more-threads').hidden = true;
+  get('thread-box').hidden = true;
+  activeThread = '';
+  threadCursor = null;
+}
+
+function selectBoard() {
+  const board = boards.find(item => item.slug === boardSelect.value);
+  clearModeration();
+  get('load-threads').disabled = !board?.is_active;
+  get('board-info').textContent = board
+    ? `${board.title}${board.is_active ? '' : ' · неактивна'}${board.is_nsfw ? ' · 18+' : ''}`
+    : 'Доски отсутствуют.';
+  if (canEditBoards) openBoard(board);
+}
+
+function openBoard(board) {
+  editingBoard = board?.slug ?? '';
+  boardForm.hidden = false;
+  const controls = boardForm.elements;
+  controls.slug.readOnly = Boolean(board);
+  controls.slug.value = editingBoard;
+  controls.title.value = board?.title ?? '';
+  controls.description.value = board?.description ?? '';
+  controls.position.value = board?.position ?? 0;
+  controls.is_active.checked = board?.is_active ?? true;
+  controls.is_nsfw.checked = board?.is_nsfw ?? false;
+  get('board-media').replaceChildren(...Object.entries(mediaFields).map(([key, spec]) =>
+    field(key, spec, board?.media_overrides[key], 'Как на сайте')));
+  get('media-warning').textContent = board?.telegram_sync_warning ?? '';
+  get('save-board').textContent = board ? 'Сохранить изменения' : 'Создать доску';
+  get('delete-board').hidden = !board;
+}
+
+async function loadBoards(slug = boardSelect.value) {
+  boards = await request('/admin/boards');
+  boardSelect.replaceChildren(...boards.map(board =>
+    option(board.slug, `/${board.slug}/ — ${board.title}${board.is_active ? '' : ' (неактивна)'}`)));
+  if (boards.some(board => board.slug === slug)) boardSelect.value = slug;
+  selectBoard();
+}
+
+function pagePath(path, cursor) {
+  return cursor ? path + '?' + new URLSearchParams({cursor}) : path;
+}
+
+async function loadThreads(cursor = null) {
+  const slug = boardSelect.value;
+  const page = await request(pagePath('/boards/' + encodeURIComponent(slug) + '/threads', cursor));
+  const list = get('thread-list');
+  if (!cursor) list.replaceChildren();
+  for (const thread of page.items) {
+    const item = element('li');
+    const button = element('button', `#${thread.id} · ${thread.subject || 'Без заголовка'}`);
+    button.onclick = action(() => openThread(String(thread.id)), 'Тред загружен.');
+    item.append(button);
+    list.append(item);
+  }
+  threadCursor = page.next_cursor;
+  get('more-threads').hidden = !threadCursor;
+  if (!list.children.length) list.append(element('li', 'Видимых тредов нет.'));
+}
+
+function editThread(id, thread) {
+  activeThread = id;
+  get('thread-title').textContent = `Тред #${id}`;
+  get('thread-box').hidden = false;
+  threadForm.elements.subject.value = thread?.subject ?? '';
+  threadForm.elements.subject.dataset.initial = thread?.subject ?? '';
+  threadForm.elements.subject.placeholder = thread ? '' : 'Оставьте пустым, чтобы сохранить заголовок';
+  get('thread-flags').replaceChildren(...Object.entries(flags).map(([key, label]) =>
+    field(key, [label, 'bool'], thread?.[key], 'Без изменений')));
+  for (const key of Object.keys(flags)) {
+    threadForm.elements[key].dataset.initial = threadForm.elements[key].value;
+  }
+}
+
+function postItem(post, deletable) {
+  const item = element('li');
+  item.dataset.postId = post.id;
+  item.append(element('strong', `#${post.id} · ${post.author_name}`));
+  item.append(element('p', post.body || (post.media.length ? `Вложений: ${post.media.length}` : 'Пустой пост')));
+  if (deletable) {
+    const button = element('button', 'Удалить ответ');
+    button.className = 'danger';
+    button.onclick = action(() => deletePost(String(post.id), item), 'Ответ удалён.');
+    item.append(button);
+  }
+  return item;
+}
+
+async function openThread(id, cursor = null) {
+  const page = await request(pagePath('/threads/' + id, cursor));
+  const replies = get('replies');
+  if (!cursor) {
+    editThread(id, page.thread);
+    get('thread-posts').hidden = false;
+    get('op').replaceChildren(page.op ? postItem(page.op, false) : element('li', 'Первый пост отсутствует.'));
+    replies.replaceChildren();
+  }
+  replies.prepend(...page.replies.map(post => postItem(post, true)));
+  replyCursor = page.next_cursor;
+  get('more-replies').hidden = !replyCursor;
+}
+
+async function deletePost(id, item) {
+  if (!confirm(`Удалить ответ #${id} без возможности восстановления?`)) return false;
+  await request('/admin/posts/' + id, 'DELETE');
+  (item ?? get('replies').querySelector(`[data-post-id="${id}"]`))?.remove();
+  return true;
+}
+
+async function loadBans() {
+  const bans = await request('/admin/ip_bans');
+  get('bans').replaceChildren(...bans.map(ban => {
+    const item = element('li', `${ban.ip} · ${new Date(ban.created_at).toLocaleString('ru')} · ${ban.reason || 'Без причины'} `);
+    const button = element('button', 'Снять бан');
+    button.onclick = action(async () => {
+      await request('/admin/ip_bans/' + encodeURIComponent(ban.ip), 'DELETE');
+      item.remove();
+    }, 'Бан снят.');
+    item.append(button);
+    return item;
+  }));
+  if (!bans.length) get('bans').append(element('li', 'Активных банов нет.'));
+}
+
+function appearanceFields(settings) {
+  const appearance = settings.appearance;
+  const label = element('label', 'Тема');
+  const select = element('select');
+  select.name = 'appearance.active_theme';
+  if (!Object.hasOwn(themes, appearance.active_theme)) {
+    select.append(option(appearance.active_theme, 'Сохранённая тема'));
+  }
+  select.append(...Object.entries(themes).map(([name, theme]) => option(name, theme.label)));
+  select.value = appearance.active_theme;
+  label.append(select);
+  const preview = element('section');
+  preview.id = 'preview';
+  preview.setAttribute('aria-label', 'Предпросмотр оформления');
+  preview.append(element('strong'), element('p'));
+  return [label, ...Object.entries(colors).map(([key, caption]) => {
+    const value = appearance.style_vars[key];
+    return field('appearance.' + key, [caption, 'color'], /^#[0-9a-f]{6}$/i.test(value) ? value : '');
+  }), preview];
+}
+
+function updatePreview() {
+  const controls = settingsForm.elements;
+  const preview = get('preview');
+  const theme = controls['appearance.active_theme'].value;
+  const defaults = (Object.hasOwn(themes, theme) ? themes[theme] : themes.dark).colors;
+  const [accent, surface, text] = Object.keys(colors).map((key, index) => {
+    const control = controls['appearance.' + key];
+    return control.value && control.validity.valid ? control.value : defaults[index];
+  });
+  preview.style.setProperty('--preview-accent', accent);
+  preview.style.backgroundColor = surface;
+  preview.style.color = text;
+  preview.querySelector('strong').textContent = controls['site.title'].value || 'Название сайта';
+  preview.querySelector('p').textContent = controls['site.description'].value || 'Текст на фоне темы';
+}
+
+function drawSettings(settings) {
+  const container = get('settings-fields');
+  const expanded = new Set([...container.querySelectorAll('details[open] summary')].map(node => node.textContent));
+  container.replaceChildren();
+  for (const [group, caption, specs] of settingsGroups) {
+    const details = element('details');
+    details.open = expanded.has(caption);
+    const fields = element('div');
+    fields.className = 'fields';
+    fields.append(...Object.entries(specs).map(([key, spec]) =>
+      field(group + '.' + key, spec, settings[group][key])));
+    details.append(element('summary', caption), fields);
+    container.append(details);
+  }
+  const appearance = element('details');
+  appearance.open = expanded.has('Внешний вид');
+  const fields = element('div');
+  fields.className = 'fields';
+  fields.append(...appearanceFields(settings));
+  appearance.append(element('summary', 'Внешний вид'), fields);
+  container.append(appearance);
+  for (const control of container.querySelectorAll('[name]')) control.dataset.initial = control.value;
+  settingsForm.hidden = false;
+  updatePreview();
+}
+
+async function start() {
+  const user = await request('/auth/me');
+  if (!['owner', 'admin', 'moderator'].includes(user.role)) {
+    panel.hidden = true;
+    login.hidden = true;
+    get('nonstaff-box').hidden = false;
+    show('Для панели нужна учётная запись сотрудника.', true);
+    return;
+  }
+  login.hidden = true;
+  get('nonstaff-box').hidden = true;
+  panel.hidden = false;
+  get('user').textContent = `${user.login} (${user.role})`;
+  canEditBoards = ['owner', 'admin'].includes(user.role);
+  boardForm.hidden = !canEditBoards;
+  get('new-board').hidden = !canEditBoards;
+  get('settings-section').hidden = user.role !== 'owner';
+  await loadBoards();
+  show('Вы вошли в панель.');
+}
+
+get('login-form').onsubmit = action(async event => {
+  const form = event.currentTarget;
+  const data = Object.fromEntries(new FormData(form));
+  form.reset();
+  await request('/auth/login', 'POST', data);
+  await start();
+});
+const logout = action(async () => {
+  await request('/auth/logout', 'POST');
+  location.reload();
+});
+get('logout').onclick = logout;
+get('nonstaff-logout').onclick = logout;
+get('load-boards').onclick = action(() => loadBoards(), 'Список досок обновлён.');
+boardSelect.onchange = selectBoard;
+get('new-board').onclick = action(() => openBoard());
+get('reset-media').onclick = action(() => {
+  for (const key of Object.keys(mediaFields)) boardForm.elements[key].value = '';
+  get('media-warning').textContent = '';
+});
+boardForm.onsubmit = action(async () => {
+  const controls = boardForm.elements;
+  const data = {
+    title: controls.title.value.trim(), description: controls.description.value,
+    position: controls.position.valueAsNumber, is_active: controls.is_active.checked,
+    is_nsfw: controls.is_nsfw.checked, media_overrides: {},
+  };
+  for (const [key, [, kind]] of Object.entries(mediaFields)) {
+    const value = readField(controls[key], kind);
+    if (value !== null) data.media_overrides[key] = value;
+  }
+  const board = editingBoard
+    ? await request('/admin/boards/' + encodeURIComponent(editingBoard), 'PATCH', data)
+    : await request('/admin/boards', 'POST', {...data, slug: controls.slug.value.trim()});
+  return refreshAfterWrite(() => loadBoards(board.slug));
+}, 'Доска сохранена.');
+get('delete-board').onclick = action(async () => {
+  if (!confirm(`Удалить /${editingBoard}/ со всеми тредами без возможности восстановления?`)) return false;
+  await request('/admin/boards/' + encodeURIComponent(editingBoard), 'DELETE');
+  boardForm.hidden = true;
+  return refreshAfterWrite(loadBoards);
+}, 'Доска удалена.');
+get('load-threads').onclick = action(() => loadThreads(), 'Список тредов загружен.');
+get('more-threads').onclick = action(() => loadThreads(threadCursor), 'Список тредов дополнен.');
+get('lookup-thread').onsubmit = action(event => openThread(event.currentTarget.elements.id.value), 'Тред загружен.');
+get('edit-by-id').onclick = action(() => {
+  const lookup = get('lookup-thread');
+  if (!lookup.reportValidity()) return false;
+  editThread(lookup.elements.id.value);
+  get('thread-posts').hidden = true;
+}, 'Можно изменить тред по ID.');
+get('delete-by-id').onsubmit = action(event => deletePost(event.currentTarget.elements.id.value), 'Ответ удалён.');
+get('more-replies').onclick = action(() => openThread(activeThread, replyCursor), 'Ответы загружены.');
+threadForm.onsubmit = action(async () => {
+  const controls = threadForm.elements;
+  const update = {};
+  if (controls.subject.value !== controls.subject.dataset.initial) update.subject = controls.subject.value;
+  for (const key of Object.keys(flags)) {
+    const value = readField(controls[key], 'bool');
+    if (value !== null && controls[key].value !== controls[key].dataset.initial) update[key] = value;
+  }
+  if (!Object.keys(update).length) {
+    show('Изменений нет.');
+    return false;
+  }
+  const thread = await request('/admin/threads/' + activeThread, 'PATCH', update);
+  editThread(activeThread, thread);
+  if (get('thread-list').children.length) return refreshAfterWrite(loadThreads);
+}, 'Тред сохранён.');
+get('delete-thread').onclick = action(async () => {
+  if (!confirm(`Удалить тред #${activeThread} со всеми ответами без возможности восстановления?`)) return false;
+  await request('/admin/threads/' + activeThread, 'DELETE');
+  get('thread-box').hidden = true;
+  activeThread = '';
+  if (get('thread-list').children.length) return refreshAfterWrite(loadThreads);
+}, 'Тред удалён.');
+get('load-bans').onclick = action(loadBans, 'Список банов загружен.');
+get('ban-form').onsubmit = action(async event => {
+  const form = event.currentTarget;
+  const {ip, reason} = Object.fromEntries(new FormData(form));
+  await request('/admin/ip_bans', 'POST', {ip: ip.trim(), reason: reason.trim() || null});
+  form.reset();
+  return refreshAfterWrite(loadBans);
+}, 'Бан добавлен.');
+get('load-settings').onclick = action(async () => drawSettings(await request('/admin/settings')), 'Настройки загружены.');
+settingsForm.oninput = updatePreview;
+settingsForm.addEventListener('invalid', event => {
+  const details = event.target.closest('details');
+  if (details) details.open = true;
+}, true);
+settingsForm.onsubmit = action(async () => {
+  const controls = settingsForm.elements;
+  const changes = [];
+  for (const [group, , specs] of settingsGroups) {
+    for (const [key, [, kind]] of Object.entries(specs)) {
+      const control = controls[group + '.' + key];
+      if (control.dataset.initial !== control.value) changes.push([group, key, readField(control, kind)]);
+    }
+  }
+  const theme = controls['appearance.active_theme'];
+  if (theme.dataset.initial !== theme.value) changes.push(['appearance', 'active_theme', theme.value]);
+  const changedColors = Object.keys(colors).flatMap(key => {
+    const control = controls['appearance.' + key];
+    return control.dataset.initial === control.value ? [] : [[key, control.value]];
+  });
+  if (!changes.length && !changedColors.length) {
+    show('Изменений нет.');
+    return false;
+  }
+  const settings = await request('/admin/settings');
+  for (const [group, key, value] of changes) settings[group][key] = value;
+  for (const [key, value] of changedColors) {
+    if (value) settings.appearance.style_vars[key] = value;
+    else delete settings.appearance.style_vars[key];
+  }
+  drawSettings(await request('/admin/settings', 'PUT', settings));
+}, 'Настройки сохранены.');
+action(start)();
+</script>
+</body>
+</html>
