@@ -1,0 +1,26 @@
+[Unit]
+Description=Imageboard media processing worker
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=/srv/imageboard-media
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+User=imageboard
+WorkingDirectory=/srv/imageboard-engine
+EnvironmentFile=/etc/imageboard-engine.env
+ExecStart=/srv/imageboard-engine/.venv/bin/python -m scripts.media_worker
+Restart=on-failure
+RestartSec=10s
+KillMode=control-group
+TimeoutStopSec=30s
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/imageboard-media
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+[Unit]
+Description=Check Imageboard media disk, quotas and queues
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=imageboard
+WorkingDirectory=/srv/imageboard-engine
+EnvironmentFile=/etc/imageboard-engine.env
+ExecStart=/srv/imageboard-engine/.venv/bin/python -m scripts.monitor_media
+TimeoutStartSec=30s
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true

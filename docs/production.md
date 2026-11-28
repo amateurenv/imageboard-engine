@@ -16,18 +16,73 @@ realtime, расширить минимальный `/admin` и подготов
 4. Настрой HTTPS на reverse proxy и не открывай uvicorn в интернет напрямую
 5. Включи резервные копии PostgreSQL и закрытого каталога медиа. Регулярно
    проверяй согласованное восстановление базы и файлов в отдельном окружении
-6. Запускай `python -m scripts.cleanup_sessions` по таймеру
-7. Запускай `python -m scripts.cleanup_posting_claims` и
-   `python -m scripts.cleanup_media_files` по таймеру
-8. Для обработки вложений запусти отдельный процесс `python -m scripts.media_worker`
-   с тем же закрытым `MEDIA_STORAGE_ROOT`, но не публикуй этот каталог через web server
+6. Настрой worker, таймер очистки и таймер мониторинга по инструкции ниже
 
-## наблюдаемость
+## worker, очистка и мониторинг
 
-Базовый мониторинг обязателен. Собирай логи приложения и worker через systemd
-или другой менеджер процессов. Настрой проверки `/ready` и оповещения о
-нехватке места, росте очередей обработки и очистки, повторяющихся ошибках worker.
-Prometheus и Grafana отложены.
+После инвентаризации скопируй примеры из `deploy/` в `/etc/systemd/system/`,
+убрав суффикс `.example`. В `imageboard-media-worker.service`,
+`imageboard-cleanup.service` и `imageboard-media-monitor.service` сверь
+пользователя `imageboard`, каталог проекта, интерпретатор и общий
+`EnvironmentFile`. В cleanup и worker замени `/srv/imageboard-media` в
+`RequiresMountsFor` и `ReadWritePaths` на фактический `MEDIA_STORAGE_ROOT`.
+Пользователю сервиса нужны права на чтение кода и запись на медиатом.
+
+```bash
+sudo systemd-analyze verify /etc/systemd/system/imageboard-media-worker.service \
+    /etc/systemd/system/imageboard-{cleanup,media-monitor}.{service,timer}
+sudo systemctl daemon-reload
+sudo systemctl enable --now imageboard-media-worker.service \
+    imageboard-cleanup.timer imageboard-media-monitor.timer
+systemctl list-timers 'imageboard-*'
+sudo systemctl start imageboard-cleanup.service
+sudo systemctl start imageboard-media-monitor.service
+journalctl -u imageboard-media-worker -u imageboard-cleanup -u imageboard-media-monitor
+```
+
+Оба таймера срабатывают каждые пять минут и после простоя догоняют пропущенный
+запуск. Cleanup удаляет истёкшие claims, обрабатывает задачи файловой очистки
+и удаляет истёкшие сессии. systemd не запускает второй экземпляр активного
+сервиса. При ошибке команды цепочка прерывается до следующего запуска.
+Ошибки отдельных файлов остаются в очереди с действующим backoff.
+
+`python -m scripts.monitor_media` выводит одну строку JSON в stdout.
+При запуске systemd она попадает в journald. Команда проверяет идентификатор
+тома, свободные блоки с учётом порога inode, учитываемые квотой файлы и резервы,
+размер очередей, просроченные lease и текущие ошибки. `disk_headroom_bytes`
+показывает запас после вычета свободного резерва, ожидаемых записей и
+multipart-бюджета. `quota_headroom_bytes` показывает запас квоты после учтённых
+байтов и multipart-бюджета.
+
+Код завершения `0` означает штатный снимок. Код `1` означает предупреждение
+и отражается как ошибка запуска в systemd. Причины перечислены в `warnings`:
+
+- использовано не менее 90% квоты или закончился запас для записи на том
+- в очереди есть обработка или очистка старше 15 минут либо просроченный lease
+- есть окончательно неудачные обработки, повторные попытки с ошибками или
+  незавершённые задачи очистки с ошибками
+
+Код `2` означает, что снимок получить не удалось. Проверь PostgreSQL,
+миграции, монтирование и соответствие тома реестру. Для диагностики следи
+за состоянием трёх сервисов и их журналом. Для API используй `/ready`.
+Снимки показывают текущее состояние. История отдельных сбоев обработки
+и очистки доступна в журналах worker и cleanup.
+
+### проверка восстановления worker
+
+Выполняй проверку на тестовом окружении с отдельными БД и томом. Загрузи тестовое
+вложение и дождись `processing`. Останови worker через
+`systemctl stop imageboard-media-worker`, затем запусти через
+`systemctl start imageboard-media-worker`. Для проверки автоматического
+перезапуска при аварии на том же тестовом окружении можно вместо остановки
+завершить весь cgroup командой
+`systemctl kill --kill-whom=all --signal=SIGKILL imageboard-media-worker`.
+При аварии systemd запустит новый процесс через 10 секунд. Задача останется
+в PostgreSQL до истечения 10-минутного lease, после чего worker подберёт её
+снова. Сверь `ready`, производные файлы и исчезновение карантинного исходника
+после cleanup. При исчерпании трёх попыток запись перейдёт в `failed`.
+Интеграционный тест `test_media_worker_recovers_after_process_stop` останавливает
+реальный процесс после частичной записи и ускоряет истечение lease в тестовой БД.
 
 ## дисковая квота медиахранилища
 
@@ -54,8 +109,9 @@ Multipart-тело ограничено размером файла плюс 64 
 chunked и временный каталог Nginx. Меняй лимиты при остановленной записи.
 
 Для первичного запуска и обновления с 024 останови приём загрузок в Nginx,
-API, worker и таймеры очистки. Смонтируй том, примени миграции и выполни
-`python -m scripts.inventory_media_storage` с настройками этого окружения.
+API, worker, таймер очистки и активный сервис очистки. Смонтируй том,
+примени миграции и выполни `python -m scripts.inventory_media_storage`
+с настройками этого окружения.
 Команда связывает БД с идентификатором тома, учитывает имеющиеся файлы и
 выводит неизвестные пути. Файлы и публикации сохраняются. При заполнении новые
 загрузки получат `503 media_storage_full`. Выдача и штатная очистка доступны.

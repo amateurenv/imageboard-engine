@@ -7,12 +7,14 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import uuid
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from io import BytesIO
 from pathlib import Path
+from urllib.parse import urlencode, urlsplit
 
 import asyncpg
 import pytest
@@ -50,6 +52,7 @@ from app.ws.manager import DisabledWebSocketManager
 from scripts.cleanup_media_files import cleanup_media_files
 from scripts.inventory_media_storage import inventory_media_storage
 from scripts.media_worker import MAX_PROCESSING_ATTEMPTS, PROCESSING_LEASE, process_job
+from scripts.monitor_media import snapshot, warnings
 
 pytestmark = pytest.mark.integration
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -1361,6 +1364,119 @@ async def test_media_quota_promotes_materialized_source_at_free_space_boundary(
     row = await quota.pool.fetchrow("SELECT * FROM media_disk_files WHERE path=$1", path)
     assert row["bytes"] == reserved_bytes(len(payload))
     assert row["work_bytes"] == work and row["expires_at"] is None
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(sys.platform != "linux", reason="requires the Linux worker filesystem guard")
+async def test_media_worker_recovers_after_process_stop(http_client: AsyncClient) -> None:
+    """новый процесс удаляет незавершённый файл и обрабатывает задачу после lease"""
+    quota = app.state.media_quota
+    repository = MediaRepository(quota.pool)
+    source = quota.storage.new_quarantine_path(".upload")
+    payload = image_bytes("PNG")
+    await quota.reserve_source(source, len(payload))
+    quota.storage.prepare_parent(source).write_bytes(payload)
+    media = await repository.create(path=source, size=len(payload), mime_type="image/png")
+    work = work_budget("image", "image/png", False)
+    async with quota.transaction() as connection:
+        await quota.promote_source(
+            connection, source, media_id=media.id, size=len(payload), work=work,
+        )
+    schema = await quota.pool.fetchval("SELECT current_schema()")
+    database = urlsplit(os.environ["TEST_DATABASE_URL"])
+    query = "&".join(filter(None, (database.query, urlencode({"search_path": schema}))))
+    env = {
+        **os.environ,
+        "APP_ENV": "test",
+        "DATABASE_URL": database._replace(query=query).geturl(),
+        "REDIS_URL": os.environ["TEST_REDIS_URL"],
+        "MEDIA_STORAGE_ROOT": str(quota.storage.root),
+    }
+    paused_worker = """
+import asyncio
+from threading import Event
+from scripts import media_worker
+
+def pause_after_partial_write(source, display, preview, is_animation):
+    display.write_bytes(b"partial")
+    Event().wait()
+
+media_worker.make_derivatives = pause_after_partial_write
+asyncio.run(media_worker.run_worker())
+"""
+    before = await snapshot(quota)
+    assert before["queued"] == 1
+    assert before["quota_pending_bytes"] == work
+    assert before["quota_charged_bytes"] == reserved_bytes(len(payload)) + work
+
+    @asynccontextmanager
+    async def subprocess_worker(*args: str):
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, *args, cwd=PROJECT_ROOT, env=env,
+        )
+        try:
+            yield process
+        finally:
+            if process.returncode is None:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5)
+                except TimeoutError:
+                    process.kill()
+                    await process.wait()
+                    raise
+
+    async with subprocess_worker("-c", paused_worker) as process:
+        async with asyncio.timeout(15):
+            while True:
+                assert process.returncode is None
+                paths = await quota.pool.fetchval(
+                    "SELECT work_paths FROM media_disk_files WHERE path=$1", source,
+                )
+                if paths and quota.storage.resolve(paths[0]).exists():
+                    partial = quota.storage.resolve(paths[0])
+                    break
+                await asyncio.sleep(0.05)
+
+    assert partial.read_bytes() == b"partial"
+    await quota.pool.execute(
+        "UPDATE media SET processing_lease_until=now()-interval '1 second' WHERE id=$1",
+        media.id,
+    )
+    stopped = await snapshot(quota)
+    assert stopped["processing"] == stopped["expired_processing_leases"] == 1
+    assert "expired_processing_leases" in warnings(stopped)
+    async with subprocess_worker("-m", "scripts.media_worker") as process:
+        async with asyncio.timeout(15):
+            while True:
+                assert process.returncode is None
+                ready = await repository.get_by_id(media.id)
+                if ready is not None and ready.processing_state.value == "ready":
+                    break
+                await asyncio.sleep(0.05)
+
+    assert ready.processing_attempts == 2
+    assert not partial.exists()
+    assert ready.display_path and ready.preview_path
+    for path in (ready.display_path, ready.preview_path):
+        with Image.open(quota.storage.resolve(path)) as derivative:
+            assert derivative.format == "WEBP"
+    processed = await snapshot(quota)
+    assert processed["processing"] == processed["failed"] == processed["quota_pending_bytes"] == 0
+    assert processed["cleanup_pending"] == 1
+    await quota.pool.execute(
+        """UPDATE media_cleanup_tasks SET created_at=now()-interval '16 minutes',
+           last_error='temporary failure' WHERE relative_path=$1""",
+        source,
+    )
+    pending = await snapshot(quota)
+    assert pending["old_cleanup"] == pending["cleanup_errors"] == 1
+    assert {"old_cleanup", "cleanup_errors"}.issubset(warnings(pending))
+    assert await cleanup_media_files(repository=repository, storage=quota.storage) == 1
+    assert not quota.storage.resolve(source).exists()
+    cleaned = await snapshot(quota)
+    assert cleaned["cleanup_pending"] == cleaned["cleanup_errors"] == 0
+    assert cleaned["quota_charged_bytes"] < processed["quota_charged_bytes"]
 
 
 @pytest.mark.anyio

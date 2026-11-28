@@ -1,11 +1,21 @@
 [Unit]
 Description=Remove expired Imageboard sessions, claims and queued media files
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=/srv/imageboard-media
 
 [Service]
 Type=oneshot
 User=imageboard
 WorkingDirectory=/srv/imageboard-engine
 EnvironmentFile=/etc/imageboard-engine.env
-ExecStart=/srv/imageboard-engine/.venv/bin/python -m scripts.cleanup_sessions
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/imageboard-media
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0027
+TimeoutStartSec=15min
 ExecStart=/srv/imageboard-engine/.venv/bin/python -m scripts.cleanup_posting_claims
 ExecStart=/srv/imageboard-engine/.venv/bin/python -m scripts.cleanup_media_files
+ExecStart=/srv/imageboard-engine/.venv/bin/python -m scripts.cleanup_sessions

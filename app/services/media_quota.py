@@ -139,6 +139,18 @@ class MediaQuota:
         """проверить объём под общей блокировкой до увеличения резерва"""
 
         await self._lock_inventory(connection)
+        charged, pending = await self.usage(connection)
+        ingress = self.settings.media_ingress_budget
+        future_writes = pending + (increase if pending_delta is None else pending_delta)
+        if (
+            charged + increase + ingress > self.settings.media_storage_max_bytes
+            or self.free_bytes()
+            < self.settings.media_storage_min_free_bytes + future_writes + ingress
+        ):
+            raise MediaStorageFull("media storage quota reached")
+
+    async def usage(self, connection: Connection) -> tuple[int, int]:
+        """вернуть учтённые байты и объём ещё не выполненных записей"""
         row = await connection.fetchrow(
             """SELECT coalesce(sum(bytes + work_bytes), 0) AS charged,
                       coalesce(sum(work_bytes + CASE WHEN expires_at IS NOT NULL
@@ -146,14 +158,7 @@ class MediaQuota:
                FROM media_disk_files"""
         )
         assert row is not None
-        ingress = self.settings.media_ingress_budget
-        future_writes = row["pending"] + (increase if pending_delta is None else pending_delta)
-        if (
-            row["charged"] + increase + ingress > self.settings.media_storage_max_bytes
-            or self.free_bytes()
-            < self.settings.media_storage_min_free_bytes + future_writes + ingress
-        ):
-            raise MediaStorageFull("media storage quota reached")
+        return int(row["charged"]), int(row["pending"])
 
     async def _lock_inventory(self, connection: Connection) -> None:
         inventory = await connection.fetchval(

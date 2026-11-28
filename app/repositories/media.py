@@ -264,6 +264,35 @@ def _to_media_record(row: Record) -> MediaRecord:
     )
 
 
+async def queue_metrics(connection: Connection, backlog_age: timedelta) -> dict[str, int]:
+    """посчитать необработанные задачи и ошибки в текущем снимке бд"""
+    row = await connection.fetchrow(
+        """SELECT processing.*, cleanup.* FROM (
+            SELECT count(*) FILTER (WHERE processing_state='queued') AS queued,
+                   count(*) FILTER (WHERE processing_state='processing') AS processing,
+                   count(*) FILTER (WHERE processing_state='failed') AS failed,
+                   count(*) FILTER (WHERE processing_state='processing'
+                       AND processing_lease_until <= now()) AS expired_processing_leases,
+                   count(*) FILTER (WHERE processing_state='queued'
+                       AND created_at <= now() - $1::interval) AS old_queued,
+                   count(*) FILTER (WHERE processing_state='queued'
+                       AND last_processing_error IS NOT NULL) AS processing_retry_errors,
+                   count(*) FILTER (WHERE processing_state='queued'
+                       AND last_processing_error='media_storage_full') AS storage_deferrals
+            FROM media WHERE processing_state IN ('queued', 'processing', 'failed')
+        ) AS processing CROSS JOIN (
+            SELECT count(*) AS cleanup_pending,
+                   count(*) FILTER (WHERE created_at <= now() - $1::interval) AS old_cleanup,
+                   count(*) FILTER (WHERE lease_until <= now()) AS expired_cleanup_leases,
+                   count(*) FILTER (WHERE last_error IS NOT NULL) AS cleanup_errors
+            FROM media_cleanup_tasks WHERE completed_at IS NULL
+        ) AS cleanup""",
+        backlog_age,
+    )
+    assert row is not None
+    return dict(row)
+
+
 class MediaRepository:
     """доступ к файлам медиа"""
 
