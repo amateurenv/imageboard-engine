@@ -4,10 +4,10 @@
 
 ## Статус
 
-Это ранний локальный прототип. Основа backend уже проверена: миграции,
-транзакции модерации, CSRF, антиспам, cursor pagination, обычные и profile-доски.
-Перед публичным запуском ещё нужно завершить media, realtime и настоящую
-серверную инфраструктуру
+Это локальный backend-прототип. Ветка разработки `main3` включает проверенную
+основу публикаций и модерации, медиаобработку до WebM-видеостикеров и миграции
+`001`–`024`. Для публичного запуска ещё нужны эксплуатационные проверки и
+инфраструктура из [плана развёртывания](docs/production.md).
 
 Универсальный маршрут `/api/v1/media` и `/api/v1/ws` намеренно выключены. Для realtime
 подготовлена базовая модель подписок, heartbeat и лимитов, но её ещё нужно
@@ -35,19 +35,22 @@
 - unit-тесты и HTTP-интеграционные тесты, которые запускаются при заданных
   `TEST_DATABASE_URL` и `TEST_REDIS_URL`
 - Ruff, MyPy и проверка запуска с PostgreSQL/Redis
-- CSRF-защита изменяющих staff-маршрутов
+- cookie-сессии и CSRF-защита административных изменений, модерации и настроек
+  профиля, self-delete по аккаунту и выхода
 - owner-модерация profile-досок: pin, lock, hide и delete с moderation log
 - self-delete анонимных и account-публикаций без раскрытия автора
 - posting claims для атомарной привязки готовых media к будущему треду или ответу
-- image upload через claim: JPEG, PNG, static WebP, GIF и animated WebP в закрытый quarantine
+- публичная загрузка JPEG, PNG, WebP и GIF по claim в закрытый quarantine
 - worker создаёт безопасный WebP display и статичный WebP preview через server-side re-encode
 - выдача только ready derivatives через FastAPI-проверку и internal Nginx
 - audio MP3/M4A/AAC и voice OGG/Opus через private quarantine и canonical transcoding
 - видео MP4/H.264 с AAC или без звука, статичный WebP preview и HTTP Range через Nginx
+- внутренняя обработка `video_note` и внутренние ответы со статическим WebP,
+  TGS или WebM-стикером
 - защита от потерянных частичных обновлений досок и тредов
 - ограничение bcrypt-пароля 72 UTF-8 байтами и контролируемый `409` для повторного IP-ban
-- команда очистки истёкших staff-сессий
-- GitHub Actions, запускающий Ruff и pytest при push и pull request
+- команды очистки истёкших сессий, claims и файлов
+- GitHub Actions с Ruff, MyPy и pytest при push и pull request
 
 ## Что пока не следует считать готовым
 
@@ -55,9 +58,9 @@
 - полноценной админ-панели пока нет: минимальная страница `/admin` управляет
   входом, досками и настройками через существующее API
 - CDN и production Nginx пока не настроены - есть только tracked template
-- для публикации `video_note` нужен будущий Telegram-адаптер
-- Telegram-бот и антивирус ещё не реализованы
-- WebSocket-события, Telegram-бот и публичный frontend не готовы
+- для Telegram-публикации видеокружков и стикеров нужен адаптер с привязкой аккаунта
+- сканер вложений, дисковые квоты, метрики worker, WebSocket и публичный frontend
+  остаются в плане
 - нет production-конфигурации reverse proxy, HTTPS, резервного копирования и мониторинга
 
 ## Стек
@@ -73,21 +76,31 @@ app/
   repositories/   SQL-запросы к postgresql
   schemas/        формы запросов и ответов API
   services/       правила работы движка
+  ws/             основа realtime
+deploy/           примеры nginx и systemd
 migrations/       SQL-миграции
 scripts/          служебные скрипты
 tests/            автоматические проверки
 ```
 
+Основной поток запроса проходит от маршрута через сервис и репозиторий к
+PostgreSQL. Сервис отвечает за policy и транзакцию. PostgreSQL хранит сессии,
+контент и очередь медиа, Redis обслуживает rate limit и будит worker.
+
 ## Локальный запуск
 
-Нужны Python 3.14+, PostgreSQL и Redis
+Нужны Python 3.14, PostgreSQL и Redis. Проверенный Linux-стек использует
+Ubuntu 24.04, PostgreSQL 16 и Redis 7. Для полного медиацикла установи FFmpeg
+с FFprobe, `librlottie0-1`, `util-linux` и Nginx. Требования к кодекам и
+выдаче перечислены в [инструкции по развёртыванию](docs/production.md).
 
 ```bash
 git clone https://github.com/amateurenv/imageboard-engine.git
 cd imageboard-engine
 python3.14 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e ".[dev]"
+python -m pip install --require-hashes -r requirements.lock
+python -m pip install --no-deps -e .
 ```
 
 Создай локальную базу и роль. Пароль ниже - только пример, для своего окружения
@@ -165,13 +178,18 @@ GET /api/v1/threads/{thread_id}?limit=100&cursor=...
 через существующий `POST /api/v1/auth/login`: отдельной public-auth системы нет.
 
 Profile-доска читается через `GET /api/v1/profiles/{handle}`, меняется владельцем
-через `PATCH /api/v1/profiles/{handle}` с cookie-сессией и CSRF-заголовком.
-Handle хранится без `@`, неизменяем и образует URL `/@handle`.
+или staff через `PATCH /api/v1/profiles/{handle}` с cookie-сессией и
+CSRF-заголовком. Handle хранится без `@`, неизменяем и образует canonical URL
+`/@handle`. Canonical URL досок и тредов предназначены для будущего frontend.
+Маршруты REST для чтения и изменения тредов принимают `thread_id`.
+Маршруты `PATCH` и `DELETE` под `/api/v1/profiles/{handle}/threads/{thread_id}`
+и `/api/v1/profiles/{handle}/posts/{post_id}` управляют состоянием публикаций.
 
 Policy создания тредов и ответов независимы: `anyone` допускает анонимов,
 `authenticated` требует сессию, `owner_only` оставляет доступ владельцу profile.
-Staff сохраняет override. Ошибки имеют стабильные коды `authentication_required`
-и `posting_forbidden`.
+По умолчанию профиль использует `owner_only` для тредов и `authenticated`
+для ответов. Владелец профиля и staff имеют право публикации по своей роли.
+Отказы возвращают `401 authentication_required` и `403 posting_forbidden`.
 
 ## Удаление собственных публикаций
 
@@ -189,7 +207,7 @@ DELETE /api/v1/posts/{post_id}
 удаляется только вместе с тредом. Успешное self-delete действие и moderation log
 сохраняются одной транзакцией. Перебор анонимного пароля ограничен Redis.
 
-## Posting claims и image upload
+## Posting claims и загрузка медиа
 
 Клиент сначала получает временное одноразовое право подготовить вложения для
 одной доски:
@@ -199,8 +217,9 @@ POST /api/v1/boards/{slug}/posting-claims
 ```
 
 Ответ содержит opaque `token`, `expires_at` и лимит числа вложений. Token
-возвращается только один раз и хранится в PostgreSQL только как hash. Claim живёт
-30 минут по настройке `posting_claims.ttl_minutes`.
+возвращается только один раз и хранится в PostgreSQL только как hash. Claim входит
+в контекст одной доски и авторизованного аккаунта, если его создал вошедший
+пользователь. Срок по умолчанию 30 минут, допустимый диапазон 1–120 минут.
 
 Первый upload-маршрут намеренно узкий:
 
@@ -229,10 +248,12 @@ GET, HEAD /media/{public_key}/display
 GET, HEAD /media/{public_key}/content
 ```
 
-FastAPI снова проверяет key, `ready`, attach и видимость поста/треда, затем
-возвращает `X-Accel-Redirect`. Байты читает только internal location Nginx из
-`deploy/nginx.conf.example`; FastAPI не передаёт файл потоком. Hide или delete
-сразу возвращает `404`, даже пока фоновая cleanup-очередь ещё удаляет файл.
+FastAPI снова проверяет key, `ready`, attach и видимость доски, поста и треда,
+затем возвращает `X-Accel-Redirect`. Байты читает internal location Nginx из
+`deploy/nginx.conf.example`. После скрытия или удаления новый запрос к серверу
+возвращает `404`, даже пока cleanup-очередь удаляет файл. Изображения, audio и
+voice отдаются с `public, max-age=31536000, immutable`, поэтому уже закешированные
+копии могут оставаться у клиента. Видео, стикеры и их превью используют `no-store`.
 Шаблон Nginx не настраивает production-сервер сам: оператор обязан указать
 абсолютный `MEDIA_STORAGE_ROOT`, сохранить private permissions и не публиковать
 storage через public `alias`.
@@ -325,13 +346,13 @@ media и помечает claim consumed. Один claim нельзя испол
 |---|---:|---|
 | photo JPEG/PNG/static WebP | да | до 20 MiB |
 | animation GIF / animated WebP | да | до 20 MiB и server-side animation limits |
-| video MP4 | да | до 20 MiB, 120 секунд, 1920×1080 или 1080×1920, 30 кадров/с |
-| video note | будущий Telegram-бот | до 20 MiB, 60 секунд, 640×640, 30 кадров/с |
+| video MP4 | да | до 20 MiB, 120 секунд, 1920×1080 или 1080×1920, 30 кадров/с, 3 600 видеопакетов |
+| video note | будущий Telegram-бот | до 20 MiB, 60 секунд, квадрат до 640×640, 30 кадров/с, 1 800 видеопакетов |
 | music/audio MP3/M4A/AAC | да | до 20 MiB, до 30 минут, до 2 каналов, 48 kHz |
 | voice OGG/Opus | да | до 20 MiB, до 10 минут, 1 канал, 48 kHz |
 | static sticker | внутренний сервис для будущего Telegram-бота | статический WebP, до 512 КиБ, длинная сторона ровно 512 px |
-| animated TGS sticker | внутренний сервис для будущего Telegram-бота | TGS до 64 КиБ, 512×512, до 3 секунд, прозрачное WebP-превью |
-| WebM video sticker | внутренний сервис для будущего Telegram-бота | VP9 без звука, до 256 КиБ, до 3 секунд и 30 кадров/с, длинная сторона ровно 512 px |
+| animated TGS sticker | внутренний сервис для будущего Telegram-бота | TGS до 64 КиБ, 512×512, до 3 секунд и 60 кадров/с, до 1 МиБ JSON |
+| WebM video sticker | внутренний сервис для будущего Telegram-бота | VP9 без звука, до 256 КиБ, 3 секунд, 30 кадров/с и 90 кадров, длинная сторона ровно 512 px |
 | Telegram custom emoji | запланировано | текстовая сущность с fallback |
 
 HTTP API уже возвращает одинаковые машинные коды ошибок для сайта и будущего
@@ -347,10 +368,13 @@ HTTP API уже возвращает одинаковые машинные ко�
 | Файл повреждён | 422 | `invalid_media` |
 | Попытка начать тред стикером | 422 | `sticker_cannot_start_thread` |
 | Вложения запрещены на доске | 403 | `media_upload_disabled` |
-| Сработал антиспам или квота | 429 | `media_rate_limited` |
+| Сработал rate limit загрузки | 429 | `media_rate_limited` |
 
-При такой ошибке временный файл удаляется, запись в базе и задание worker не
-создаются. Сервер не показывает пользователю traceback или технические пути.
+При отказе до фиксации загрузки приложение пытается удалить временный файл.
+Если ошибка найдена на этапе обработки, worker повторяет попытку в пределах
+лимита, затем переводит вложение в `failed`. Ошибки HTTP-загрузки возвращают
+код и сообщение без технических путей. Отдельного публичного маршрута опроса
+состояния worker пока нет.
 
 ## Проверки
 
@@ -360,6 +384,7 @@ HTTP API уже возвращает одинаковые машинные ко�
 ruff check .
 mypy app scripts
 pytest
+git diff --check
 ```
 
 HTTP integration tests никогда не берут `DATABASE_URL` или `REDIS_URL` приложения.
@@ -398,7 +423,7 @@ python -m pip install --no-deps -e .
 pip-compile --strip-extras --extra dev --generate-hashes --output-file requirements.lock pyproject.toml
 ```
 
-Для очистки истёкших staff-сессий по расписанию запускай:
+Для очистки истёкших сессий, claims и файлов по расписанию запускай:
 
 ```bash
 python -m scripts.cleanup_sessions
@@ -406,9 +431,14 @@ python -m scripts.cleanup_posting_claims
 python -m scripts.cleanup_media_files
 ```
 
-После staff-login сервер устанавливает cookie `csrf_token`. Каждый изменяющий
-запрос к `/api/v1/admin/...` и `POST /api/v1/auth/logout` должен передавать её
-значение в заголовке `X-CSRF-Token`.
+После входа сервер устанавливает читаемую cookie `csrf_token`. Передавай её
+в `X-CSRF-Token` при изменениях через административные и profile-маршруты,
+self-delete по аккаунту и выходе.
+
+На финальном ревью WebM в WSL Ubuntu 24.04 с Python 3.14.10 и FFmpeg 6.1.1
+прошли Ruff, MyPy по 85 файлам и `git diff --check`. Полный pytest дал 222
+прошедших теста, отдельный integration-прогон — 24. Повтор через Nginx 1.24
+подтвердил GET/HEAD, Range `206` и `416`, заголовки и `404` после модерации.
 
 ## Realtime
 
@@ -428,15 +458,19 @@ python -m scripts.cleanup_media_files
 
 ## Миграции
 
-Структура базы и начальные настройки меняются только новыми файлами в
-`migrations/`. Уже применённую миграцию не редактируй: скрипт заметит изменение
-контрольной суммы и остановится, чтобы не повредить данные
+Текущая схема включает `024_video_stickers`. Применяй миграции через
+`python -m scripts.migrate`. Структура базы и начальные настройки меняются
+новыми файлами в `migrations/`. Мигратор проверяет контрольные суммы ранее
+применённых файлов и останавливается, если они изменились.
 
 ## Ближайший план
 
-1. подключить реальный scanner, квоты, метрики, backup strategy и production Nginx
-2. закрыть realtime через Redis с ограничением соединений и нормальной остановкой
-3. подготовить production-развёртывание: HTTPS, reverse proxy, бэкапы, мониторинг и CDN
+1. Завершить эксплуатацию медиа с реальным сканером, квотами, метриками, проверкой восстановления worker и Nginx.
+2. Проверить realtime под нагрузкой, с аутентификацией, проверкой подписок и восстановлением Redis.
+3. Расширить `/admin` на стабильных API и добавить безопасную визуальную настройку.
+4. Подготовить production-развёртывание с HTTPS, reverse proxy, восстановлением из бэкапа и мониторингом.
+
+Публичный frontend, Telegram и Mini App, стикерпаки и CDN остаются отдельными этапами.
 
 ## Принципы
 
