@@ -13,6 +13,7 @@ from app.core.site_settings import MediaSettings, SiteSettings
 from app.services import image_validation
 from app.services.image_validation import validate_image
 from app.services.media_policy import MediaPolicy, MediaPolicyCode, MediaPolicyError
+from app.services.media_quota import MediaOutputTooLarge
 from app.services.media_storage import MediaStorage, MediaStorageError
 from app.services.media_upload import MediaUploadService
 from scripts import media_worker
@@ -219,11 +220,12 @@ def test_worker_derivatives_stay_inside_storage_and_drop_metadata(tmp_path: Path
     source.parent.mkdir(mode=0o700, parents=True)
     source.write_bytes(make_image("JPEG"))
 
-    display_path, preview_path = make_derivatives(str(source), storage, 42)
+    display_path = storage.prepare_parent("display/42.webp")
+    preview_path = storage.prepare_parent("previews/42.webp")
+    make_derivatives(source, display_path, preview_path)
 
-    assert display_path == "display/42.webp"
-    assert preview_path == "previews/42.webp"
-    with Image.open(storage.resolve(display_path)) as display:
+    assert preview_path.is_file()
+    with Image.open(display_path) as display:
         assert display.format == "WEBP"
         assert not display.getexif()
 
@@ -239,41 +241,27 @@ def test_worker_reencodes_animation_to_animated_display_and_static_preview(
     source.parent.mkdir(mode=0o700, parents=True)
     source.write_bytes(make_animation(image_format))
 
-    display_path, preview_path = make_derivatives(str(source), storage, 43, True)
+    display_path = storage.prepare_parent("display/43.webp")
+    preview_path = storage.prepare_parent("previews/43.webp")
+    make_derivatives(source, display_path, preview_path, True)
 
-    with Image.open(storage.resolve(display_path)) as display:
+    with Image.open(display_path) as display:
         assert display.format == "WEBP"
         assert display.n_frames == 2
-    with Image.open(storage.resolve(preview_path)) as preview:
+    with Image.open(preview_path) as preview:
         assert preview.format == "WEBP"
         assert preview.n_frames == 1
 
 
-def test_worker_removes_partial_derivatives_after_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """ошибка preview не оставляет уже созданный display рядом с quarantine"""
+def test_webp_writer_stops_before_exceeding_reservation(tmp_path: Path) -> None:
+    """ограниченная запись не оставляет на диске больше выделенного размера"""
 
-    storage = MediaStorage(tmp_path)
-    source = storage.resolve("quarantine/source.jpg")
-    source.parent.mkdir(mode=0o700, parents=True)
-    source.write_bytes(make_image("JPEG"))
-    original_save = media_worker._save_webp
-    calls = 0
-
-    def fail_second_save(image: Image.Image, target: MediaStorage, relative_path: str) -> None:
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise OSError("disk is temporarily unavailable")
-        original_save(image, target, relative_path)
-
-    monkeypatch.setattr(media_worker, "_save_webp", fail_second_save)
-    with pytest.raises(OSError, match="temporarily unavailable"):
-        make_derivatives(str(source), storage, 99)
-
-    assert not storage.resolve("display/99.webp").exists()
-    assert not storage.resolve("previews/99.webp").exists()
+    output = tmp_path / "display.webp"
+    with media_worker.BoundedOutput(output, 2) as target:
+        target.write(b"ok")
+        with pytest.raises(MediaOutputTooLarge):
+            target.write(b"x")
+    assert output.read_bytes() == b"ok"
 
 
 def test_storage_never_follows_symlink_or_path_traversal(tmp_path: Path) -> None:

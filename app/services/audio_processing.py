@@ -7,12 +7,14 @@ from pathlib import Path
 from app.services.ffmpeg import (
     PROBE_TIMEOUT_SECONDS,
     TRANSCODE_TIMEOUT_SECONDS,
+    bounded_output,
     decode_probe,
     positive_int,
     positive_number,
     run_ffmpeg,
 )
 from app.services.media_policy import MediaPolicy, MediaType
+from app.services.media_quota import work_limits
 from app.services.media_storage import MediaStorage
 
 MAX_AUDIO_DURATION_SECONDS = 30 * 60
@@ -101,7 +103,8 @@ class FFmpegMediaProcessor:
         return AudioInspection(media_type, mime_type, duration_seconds, channels, sample_rate)
 
     def transcode(
-        self, source_path: Path, storage: MediaStorage, media_id: int, inspection: AudioInspection
+        self, source_path: Path, storage: MediaStorage, media_id: int, inspection: AudioInspection,
+        *, target: Path | None = None,
     ) -> tuple[str, str]:
         """полностью декодировать controlled source и atomically сохранить canonical derivative"""
 
@@ -114,18 +117,19 @@ class FFmpegMediaProcessor:
         else:
             relative_path, mime_type = f"voice/{media_id}.ogg", "audio/ogg"
             codec_args = ["-c:a", "libopus", "-b:a", "64k", "-ac", "1", "-ar", "48000", "-f", "ogg"]
-        temporary_path = storage.temporary_path(relative_path)
+        temporary_path = target if target is not None else storage.temporary_path(relative_path)
         try:
             self._run(
-                [
+                bounded_output([
                     self._ffmpeg_bin, "-v", "error", "-nostdin", "-y", "-i", str(source_path),
                     "-map", "0:a:0", "-vn", "-sn", "-dn", *codec_args, str(temporary_path),
-                ],
+                ], work_limits(inspection.media_type.value, mime_type, False)[0]),
                 TRANSCODE_TIMEOUT_SECONDS,
             )
             if not temporary_path.is_file() or temporary_path.stat().st_size == 0:
                 raise MediaPolicy.invalid_media("FFmpeg не создал derivative audio")
-            storage.replace_from_temporary(temporary_path, relative_path)
+            if target is None:
+                storage.replace_from_temporary(temporary_path, relative_path)
             return relative_path, mime_type
         except Exception:
             temporary_path.unlink(missing_ok=True)

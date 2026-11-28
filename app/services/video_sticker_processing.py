@@ -197,7 +197,7 @@ def transcode_video_sticker(
 
     original = inspect_video_sticker(source, ffprobe_bin=ffprobe_bin)
     ffmpeg = [
-        *PROCESS_LIMITS, ffmpeg_bin, "-v", "quiet", "-nostdin", "-y", "-xerror",
+        *PROCESS_LIMITS, ffmpeg_bin, "-v", "error", "-nostdin", "-y", "-xerror",
         "-abort_on", "empty_output",
         "-max_alloc", ALLOCATION_LIMIT, "-filter_threads", "1", *WEBM_INPUT,
         # штатный декодер VP9 не возвращает альфа-канал из WebM BlockAdditional

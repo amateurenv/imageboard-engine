@@ -1,9 +1,24 @@
 """контролируемая работа с локальными файлами media"""
 
+import errno
 import os
 import stat
+import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from uuid import uuid4
+
+_writer_fd: ContextVar[int | None] = ContextVar("media_writer_fd", default=None)
+
+
+def writer_fds() -> tuple[int, ...]:
+    """сохранить блокировку до выхода дочернего процесса"""
+
+    fd = _writer_fd.get()
+    return () if fd is None or sys.platform == "win32" else (fd,)
 
 
 class MediaStorageError(ValueError):
@@ -72,13 +87,78 @@ class MediaStorage:
         destination = self.prepare_parent(relative_path)
         os.replace(temporary_path, destination)
         os.chmod(destination, 0o600)
+        self.sync_directory(destination.parent)
+        if temporary_path.parent != destination.parent:
+            self.sync_directory(temporary_path.parent)
         return destination
+
+    def sync_file(self, path: Path) -> None:
+        """зафиксировать запись файла перед транзакцией публикации"""
+
+        with path.open("rb") as source:
+            os.fsync(source.fileno())
+        self.sync_directory(path.parent)
+
+    @staticmethod
+    def sync_directory(directory: Path) -> None:
+        """зафиксировать изменение имени на linux до обновления учёта"""
+
+        if sys.platform != "linux":
+            return
+        try:
+            fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        except FileNotFoundError:
+            return
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
     def temporary_path(self, relative_path: str) -> Path:
         """дать одноразовый путь рядом с будущим файлом для atomic replace"""
 
         destination = self.prepare_parent(relative_path)
         return destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
+
+    def work_path(self, relative_path: str, attempt: str) -> Path:
+        """вычислить имя до начала файловых операций"""
+
+        name = relative_path.replace("/", "-")
+        return self.resolve(f".work/{attempt}-{name}")
+
+    @contextmanager
+    def guard(self, key: str, *, writer: bool = False) -> Iterator[bool]:
+        """защитить файлы операции между процессами, включая дочерний encoder"""
+
+        if key.startswith("ingress:"):
+            name = key.replace(":", "-")
+        else:
+            name = sha256(key.encode()).hexdigest()[:3]
+        path = self.prepare_parent(f".locks/{name}")
+        descriptor = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+
+                    msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                if error.errno not in {errno.EACCES, errno.EAGAIN}:
+                    raise
+                yield False
+                return
+            token = _writer_fd.set(descriptor) if writer else None
+            try:
+                yield True
+            finally:
+                if token is not None:
+                    _writer_fd.reset(token)
+        finally:
+            os.close(descriptor)
 
     def delete_file(self, relative_path: str) -> bool:
         """удалить только обычный файл, не symlink и не каталог"""
@@ -87,8 +167,10 @@ class MediaStorage:
         try:
             info = path.lstat()
         except FileNotFoundError:
+            self.sync_directory(path.parent)
             return True
         if not stat.S_ISREG(info.st_mode):
             raise MediaStorageError("cleanup target is not a regular file")
         path.unlink()
+        self.sync_directory(path.parent)
         return True

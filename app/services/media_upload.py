@@ -3,6 +3,8 @@
 import asyncio
 import logging
 import secrets
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -26,7 +28,8 @@ from app.services.media_policy import (
     MediaPolicyError,
     MediaType,
 )
-from app.services.media_storage import MediaStorage, MediaStorageError
+from app.services.media_quota import MediaQuota, MediaStorageFull, work_budget
+from app.services.media_storage import MediaStorage
 from app.services.posting_claims import (
     PostingClaimError,
     StickerCannotStartThread,
@@ -76,11 +79,13 @@ class MediaUploadService:
         storage_root: Path,
         audio_processor: FFmpegMediaProcessor | None = None,
         video_processor: VideoProcessor | None = None,
+        quota: MediaQuota | None = None,
     ) -> None:
         self._pool = pool
         self._redis = redis_client
         self._settings = settings
-        self._storage = MediaStorage(storage_root)
+        self._storage = quota.storage if quota is not None else MediaStorage(storage_root)
+        self._quota = quota or MediaQuota(pool, self._storage)
         self._audio_processor = audio_processor or FFmpegMediaProcessor()
         self._video_processor = video_processor or VideoProcessor()
         self._claims = PostingClaimsRepository(pool)
@@ -97,7 +102,6 @@ class MediaUploadService:
     ) -> MediaRecord:
         """принять вложение без доверия имени, MIME или размеру клиента"""
 
-        path: str | None = None
         try:
             board = await self._claims.get_board(board_slug)
             if board is None:
@@ -109,13 +113,16 @@ class MediaUploadService:
             token_hash = hash_token(token)
             self._check_claim(await self._claims.get_claim(token_hash), board, actor)
 
-            # имя не связано с filename клиента и никогда не возвращается api
-            path = self._storage.new_quarantine_path(".upload")
-            size = await self._stream_to_quarantine(file, path, policy)
-            inspected = await asyncio.to_thread(self._inspect, self._storage.resolve(path))
+            limit = min(
+                policy.max_attachment_size_bytes, self._quota.settings.media_upload_max_file_bytes,
+            )
+            if file.size is not None and file.size > limit:
+                self._raise_file_limit(limit)
+            async with self._staging(file.size if file.size is not None else limit) as path:
+                size = await self._stream_to_quarantine(file, path, policy)
+                inspected = await asyncio.to_thread(self._inspect, self._storage.resolve(path))
 
-            async with self._pool.acquire() as connection:
-                async with connection.transaction():
+                async with self._quota.transaction() as connection:
                     locked_board = await self._claims.lock_board(connection, board_slug)
                     if locked_board is None:
                         raise PostingClaimError("board_not_found", 404)
@@ -157,15 +164,12 @@ class MediaUploadService:
                         channels=inspected.channels,
                         sample_rate=inspected.sample_rate,
                     )
+                    await self._quota.promote_source(
+                        connection, path, media_id=media.id, size=size,
+                        work=work_budget(media.media_kind, media.mime_type, media.is_animation),
+                    )
             await self._wake_worker(media.id)
             return media
-        except Exception:
-            if path is not None:
-                try:
-                    self._storage.delete_file(path)
-                except (MediaStorageError, OSError):
-                    logger.exception("could not remove failed quarantine upload")
-            raise
         finally:
             await file.close()
 
@@ -224,13 +228,11 @@ class MediaUploadService:
     ) -> MediaRecord:
         """сохранить закрытый claim и задачу обработки с общим commit"""
 
-        path: str | None = None
-        try:
-            relative_path = self._storage.new_quarantine_path(".upload")
-            descriptor, source = self._storage.open_new(relative_path)
-            path = relative_path
+        async with self._staging(len(data)) as path:
+            descriptor, source = self._storage.open_new(path)
             with open(descriptor, "wb", closefd=True) as target:
                 target.write(data)
+            await asyncio.to_thread(self._storage.sync_file, source)
             if mime_type == WEBM_STICKER_MIME:
                 # ffprobe работает до блокировки доски и треда
                 await asyncio.to_thread(
@@ -254,14 +256,30 @@ class MediaUploadService:
                         board_id=board.id, posting_claim_id=claim_id,
                         is_animation=mime_type != STICKER_MIME, media_kind=MediaType.STICKER.value,
                     )
-        except Exception:
-            if path is not None:
-                try:
-                    self._storage.delete_file(path)
-                except (MediaStorageError, OSError):
-                    logger.exception("could not remove failed quarantine sticker")
-            raise
+                    await self._quota.promote_source(
+                        connection, path, media_id=media.id, size=len(data),
+                        work=work_budget(media.media_kind, media.mime_type, media.is_animation),
+                    )
         return media
+
+    @asynccontextmanager
+    async def _staging(self, maximum: int) -> AsyncIterator[str]:
+        """защитить карантин до принятия задачи или подтверждённого удаления"""
+
+        self._quota.verify_mount()
+        path = self._storage.new_quarantine_path(".upload")
+        with self._storage.guard(path, writer=True) as acquired:
+            if not acquired:
+                raise MediaStorageFull("media storage is busy")
+            await self._quota.reserve_source(path, maximum)
+            try:
+                yield path
+            except Exception:
+                try:
+                    await self._quota.discard_source(path)
+                except Exception:
+                    logger.exception("could not remove failed quarantine upload")
+                raise
 
     async def _wake_worker(self, media_id: int) -> None:
         """сократить ожидание worker, сохраняя очередь в postgres"""
@@ -289,23 +307,35 @@ class MediaUploadService:
         """записать upload кусками и остановиться сразу после фактического лимита"""
 
         descriptor, path = self._storage.open_new(relative_path)
+        limit = min(
+            policy.max_attachment_size_bytes,
+            self._quota.settings.media_upload_max_file_bytes,
+            file.size if file.size is not None else policy.max_attachment_size_bytes,
+        )
         size = 0
         try:
             with open(descriptor, "wb", closefd=True) as target:
                 while chunk := await file.read(UPLOAD_CHUNK_SIZE):
                     size += len(chunk)
-                    if size > policy.max_attachment_size_bytes:
-                        raise MediaPolicyError(
-                            code=MediaPolicyCode.MEDIA_FILE_TOO_LARGE,
-                            message="размер вложения больше лимита доски",
-                            http_status=413,
-                            limit_bytes=policy.max_attachment_size_bytes,
-                        )
+                    if size > limit:
+                        self._raise_file_limit(limit)
                     target.write(chunk)
+            await asyncio.to_thread(self._storage.sync_file, path)
             return size
         except Exception:
             path.unlink(missing_ok=True)
             raise
+
+    @staticmethod
+    def _raise_file_limit(limit: int) -> None:
+        """сохранить код превышения допустимого размера файла"""
+
+        raise MediaPolicyError(
+            code=MediaPolicyCode.MEDIA_FILE_TOO_LARGE,
+            message="размер вложения больше допустимого лимита",
+            http_status=413,
+            limit_bytes=limit,
+        )
 
     @staticmethod
     def _check_declared_size(content_length: str | None, policy: MediaPolicy) -> None:

@@ -1,5 +1,6 @@
 """точка входа asgi приложения"""
 
+import tempfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -14,6 +15,8 @@ from app.core.config import get_settings
 from app.core.database import close_postgres_pool, create_postgres_pool
 from app.core.redis import close_redis_client, create_redis_client
 from app.core.site_settings_repository import load_site_settings
+from app.services.media_quota import MediaQuota
+from app.services.media_storage import MediaStorage
 from app.ws.manager import DisabledWebSocketManager
 
 # получаем проверенные настройки один раз для всего процесса
@@ -44,6 +47,13 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         )
         # upload и worker используют один закрытый корень, который пока не раздаётся наружу
         application.state.media_storage_root = settings.media_storage_root
+        storage = MediaStorage(settings.media_storage_root)
+        quota = MediaQuota(postgres_pool, storage, settings)
+        application.state.media_quota = quota
+        spool_probe = storage.resolve(".spool/ready")
+        if settings.app_env != "production" or storage.root.is_mount():
+            spool_probe = storage.prepare_parent(".spool/ready")
+        tempfile.tempdir = str(spool_probe.parent)
     except Exception:
         # закрываем уже созданные подключения при неудачном запуске
         if postgres_pool is not None:

@@ -367,6 +367,7 @@ def get_media_upload_service(
         request.app.state.media_storage_root,
         FFmpegMediaProcessor(settings.ffmpeg_bin, settings.ffprobe_bin),
         VideoProcessor(settings.ffmpeg_bin, settings.ffprobe_bin),
+        quota=request.app.state.media_quota,
     )
 
 

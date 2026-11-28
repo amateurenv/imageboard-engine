@@ -12,12 +12,13 @@ from app.api.dependencies import (
     check_ip_bans,
     get_client_ip,
 )
+from app.api.media_ingress import MediaIngressRoute
 from app.schemas.media import MediaUploadResponse
 from app.services.media_policy import MediaPolicyError
 from app.services.posting_claims import PostingClaimError
 from app.services.posting_policy import PostingPermissionError
 
-router = APIRouter(prefix="/boards", tags=["media"])
+router = APIRouter(prefix="/boards", tags=["media"], route_class=MediaIngressRoute)
 
 
 @router.post("/{slug}/media", response_model=MediaUploadResponse, status_code=201)

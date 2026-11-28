@@ -8,6 +8,7 @@ from pathlib import Path
 from app.services.ffmpeg import (
     PROBE_TIMEOUT_SECONDS,
     TRANSCODE_TIMEOUT_SECONDS,
+    bounded_output,
     decode_probe,
     positive_int,
     positive_number,
@@ -20,6 +21,7 @@ from app.services.media_policy import (
     MediaPolicyError,
     MediaType,
 )
+from app.services.media_quota import MP4_WORK_BYTES, PREVIEW_BYTES
 
 VIDEO_KINDS = frozenset({MediaType.VIDEO, MediaType.VIDEO_NOTE})
 MAX_VIDEO_DURATION = 120
@@ -198,8 +200,8 @@ class VideoProcessor:
             samples = round(original.audio_duration * VIDEO_SAMPLE_RATE)
             audio_filter = ["-af", f"aresample={VIDEO_SAMPLE_RATE},atrim=end_sample={samples}"]
         run_ffmpeg(
-            [
-                self._ffmpeg_bin, "-v", "quiet", "-nostdin", "-y", "-xerror",
+            bounded_output([
+                self._ffmpeg_bin, "-v", "error", "-nostdin", "-y", "-xerror",
                 "-abort_on", "empty_output+empty_output_stream", "-filter_threads", "1",
                 *MP4_INPUT, "-i", str(source), "-map", "0:v:0", "-map", "0:a:0?",
                 "-map_metadata", "-1", "-map_metadata:s", "-1", "-map_chapters", "-1",
@@ -211,7 +213,7 @@ class VideoProcessor:
                 *audio_filter, "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "128k",
                 "-fs", str(MAX_VIDEO_BYTES + 1),
                 "-movflags", "+faststart", "-f", "mp4", str(video),
-            ],
+            ], MP4_WORK_BYTES),
             TRANSCODE_TIMEOUT_SECONDS,
         )
         if not video.is_file() or not 0 < video.stat().st_size <= MAX_VIDEO_BYTES:
@@ -221,14 +223,14 @@ class VideoProcessor:
         if result.channels != original.channels or result.sample_rate != expected_sample_rate:
             raise MediaPolicy.invalid_media("канонический MP4 потерял параметры аудиодорожки")
         run_ffmpeg(
-            [
-                self._ffmpeg_bin, "-v", "quiet", "-nostdin", "-y", "-xerror",
+            bounded_output([
+                self._ffmpeg_bin, "-v", "error", "-nostdin", "-y", "-xerror",
                 "-abort_on", "empty_output", "-filter_threads", "1",
                 *MP4_INPUT, "-i", str(video), "-map", "0:v:0", "-frames:v", "1",
                 "-vf", r"scale=min(iw\,320):min(ih\,180):force_original_aspect_ratio=decrease",
                 "-map_metadata", "-1", "-c:v", "libwebp", "-threads:v", "1",
                 "-f", "image2", "-update", "1", str(preview),
-            ],
+            ], PREVIEW_BYTES),
             PROBE_TIMEOUT_SECONDS,
         )
         if not preview.is_file() or preview.stat().st_size == 0:

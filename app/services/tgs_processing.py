@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from app.services.media_policy import MediaPolicy, MediaPolicyCode, MediaPolicyError
+from app.services.media_quota import MediaStorageFull
+from app.services.media_storage import writer_fds
 from app.services.sticker_processing import STICKER_SIDE
 
 TGS_MIME = "application/x-tgsticker"
@@ -284,6 +286,7 @@ def _render_preview(clean: bytes, output: BinaryIO) -> None:
             input=clean, stdout=output, stderr=subprocess.DEVNULL,
             env={"MALLOC_ARENA_MAX": "2"},
             timeout=RENDER_TIMEOUT_SECONDS, check=True,
+            pass_fds=writer_fds(),
         )
     except FileNotFoundError as error:
         if error.filename != "/usr/bin/prlimit":
@@ -296,6 +299,8 @@ def _render_preview(clean: bytes, output: BinaryIO) -> None:
     except subprocess.TimeoutExpired as error:
         raise MediaPolicy.invalid_media("превышено время рендера TGS") from error
     except subprocess.CalledProcessError as error:
+        if error.returncode == 3:
+            raise MediaStorageFull("media filesystem refused render output") from error
         if error.returncode == 2:
             raise MediaPolicyError(
                 code=MediaPolicyCode.MEDIA_PROCESSING_UNAVAILABLE,

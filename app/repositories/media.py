@@ -39,6 +39,7 @@ WITH next_media AS (
     FROM media
     WHERE processing_state = 'queued'
       AND processing_attempts < $1
+      AND (processing_next_attempt_at IS NULL OR processing_next_attempt_at <= clock_timestamp())
     ORDER BY created_at, id
     FOR UPDATE SKIP LOCKED
     LIMIT 1
@@ -46,7 +47,8 @@ WITH next_media AS (
 UPDATE media AS candidate
 SET processing_state = 'processing',
     processing_attempts = candidate.processing_attempts + 1,
-    processing_lease_until = clock_timestamp() + $2::interval
+    processing_lease_until = clock_timestamp() + $2::interval,
+    processing_next_attempt_at = NULL
 FROM next_media
 WHERE candidate.id = next_media.id
 RETURNING candidate.id, candidate.path, candidate.size, candidate.mime_type,
@@ -66,39 +68,13 @@ SET processing_state = 'processing',
 WHERE id = $1
   AND processing_state = 'queued'
   AND processing_attempts < $2
+  AND (processing_next_attempt_at IS NULL OR processing_next_attempt_at <= clock_timestamp())
 RETURNING id, path, size, mime_type, created_at, processing_state,
           processing_attempts, processing_lease_until, last_processing_error,
           board_id, posting_claim_id, display_path, preview_path, is_animation,
           media_kind, duration_seconds, channels, sample_rate, canonical_path, canonical_mime_type
 """
 
-MARK_READY_SQL = """
-UPDATE media
-SET processing_state = 'ready',
-    processing_lease_until = NULL,
-    last_processing_error = NULL,
-    display_path = $2,
-    preview_path = $3
-WHERE id = $1 AND processing_state = 'processing'
-RETURNING id, path, size, mime_type, created_at, processing_state,
-          processing_attempts, processing_lease_until, last_processing_error
-          , board_id, posting_claim_id, display_path, preview_path, is_animation,
-            media_kind, duration_seconds, channels, sample_rate, canonical_path, canonical_mime_type
-"""
-
-MARK_AUDIO_READY_SQL = """
-UPDATE media
-SET processing_state = 'ready',
-    processing_lease_until = NULL,
-    last_processing_error = NULL,
-    canonical_path = $2,
-    canonical_mime_type = $3
-WHERE id = $1 AND processing_state = 'processing'
-RETURNING id, path, size, mime_type, created_at, processing_state,
-          processing_attempts, processing_lease_until, last_processing_error,
-          board_id, posting_claim_id, display_path, preview_path, is_animation,
-          media_kind, duration_seconds, channels, sample_rate, canonical_path, canonical_mime_type
-"""
 
 MARK_VIDEO_READY_SQL = """
 WITH ready AS (
@@ -181,6 +157,7 @@ UPDATE media
 SET processing_state = 'queued',
     processing_attempts = 0,
     processing_lease_until = NULL,
+    processing_next_attempt_at = NULL,
     last_processing_error = NULL
 WHERE id = $1 AND processing_state = 'failed'
 RETURNING id, path, size, mime_type, created_at, processing_state,
@@ -199,6 +176,7 @@ WITH next_task AS (
     FROM media_cleanup_tasks
     WHERE completed_at IS NULL
       AND (lease_until IS NULL OR lease_until <= clock_timestamp())
+      AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp())
     ORDER BY created_at, id
     FOR UPDATE SKIP LOCKED
     LIMIT 1
@@ -208,19 +186,17 @@ SET attempts = task.attempts + 1,
     lease_until = clock_timestamp() + $1::interval
 FROM next_task
 WHERE task.id = next_task.id
-RETURNING task.id, task.relative_path, task.attempts
-"""
-
-COMPLETE_CLEANUP_TASK_SQL = """
-UPDATE media_cleanup_tasks
-SET completed_at = clock_timestamp(), lease_until = NULL, last_error = NULL
-WHERE id = $1 AND completed_at IS NULL
+RETURNING task.id, task.relative_path, task.attempts, task.lease_until,
+          coalesce(task.quota_owner_path, (SELECT owner_path FROM media_disk_files
+                                          WHERE path = task.relative_path), task.relative_path)
+          AS owner_path
 """
 
 FAIL_CLEANUP_TASK_SQL = """
 UPDATE media_cleanup_tasks
-SET lease_until = NULL, last_error = $2
-WHERE id = $1 AND completed_at IS NULL
+SET lease_until = NULL, last_error = $3,
+    next_attempt_at = clock_timestamp() + interval '1 minute'
+WHERE id = $1 AND lease_until = $2 AND completed_at IS NULL
 """
 
 
@@ -257,6 +233,8 @@ class MediaCleanupTask:
     id: int
     relative_path: str
     attempts: int
+    lease_until: datetime
+    owner_path: str
 
 
 def _to_media_record(row: Record) -> MediaRecord:
@@ -291,6 +269,12 @@ class MediaRepository:
 
     def __init__(self, postgres_pool: Pool) -> None:
         self._postgres_pool = postgres_pool
+
+    @property
+    def pool(self) -> Pool:
+        """использовать тот же пул для транзакций учёта"""
+
+        return self._postgres_pool
 
     async def create(
         self,
@@ -404,31 +388,6 @@ class MediaRepository:
         )
         return None if row is None else _to_media_record(row)
 
-    async def mark_ready(
-        self,
-        media_id: int,
-        *,
-        display_path: str | None = None,
-        preview_path: str | None = None,
-    ) -> MediaRecord | None:
-        """завершить только задачу, которую worker уже захватил"""
-
-        ensure_media_transition(MediaProcessingState.PROCESSING, MediaProcessingState.READY)
-        row = await self._postgres_pool.fetchrow(
-            MARK_READY_SQL, media_id, display_path, preview_path
-        )
-        return None if row is None else _to_media_record(row)
-
-    async def mark_audio_ready(
-        self, media_id: int, *, canonical_path: str, canonical_mime_type: str
-    ) -> MediaRecord | None:
-        """завершить audio только после записи canonical derivative"""
-
-        ensure_media_transition(MediaProcessingState.PROCESSING, MediaProcessingState.READY)
-        row = await self._postgres_pool.fetchrow(
-            MARK_AUDIO_READY_SQL, media_id, canonical_path, canonical_mime_type
-        )
-        return None if row is None else _to_media_record(row)
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[Connection]:
@@ -437,6 +396,46 @@ class MediaRepository:
         async with self._postgres_pool.acquire() as connection:
             async with connection.transaction():
                 yield connection
+
+    async def lock_processing(self, connection: Connection, media_id: int, lease: datetime) -> bool:
+        """проверить срок и удержать строку до публикации файлов"""
+
+        return bool(await connection.fetchval(
+            """SELECT true FROM media WHERE id=$1 AND processing_state='processing'
+                 AND processing_lease_until=$2 AND processing_lease_until > clock_timestamp()
+               FOR UPDATE""",
+            media_id, lease,
+        ))
+
+    async def mark_image_audio_ready(
+        self, connection: Connection, media_id: int, *, display_path: str | None,
+        preview_path: str | None, canonical_path: str | None, canonical_mime_type: str | None,
+    ) -> None:
+        """сохранить производные и очередь очистки в общей транзакции"""
+
+        await connection.execute(
+            """WITH ready AS (
+                   UPDATE media SET processing_state='ready', processing_lease_until=NULL,
+                       last_processing_error=NULL, display_path=$2, preview_path=$3,
+                       canonical_path=$4, canonical_mime_type=$5
+                   WHERE id=$1 RETURNING path
+               )
+               INSERT INTO media_cleanup_tasks (relative_path)
+               SELECT path FROM ready ON CONFLICT (relative_path) DO NOTHING""",
+            media_id, display_path, preview_path, canonical_path, canonical_mime_type,
+        )
+
+    async def defer_processing(self, media_id: int, lease: datetime | None, reason: str) -> None:
+        """отложить временную нехватку ресурсов без расходования попытки"""
+
+        await self._postgres_pool.execute(
+            """UPDATE media SET processing_state='queued', processing_lease_until=NULL,
+                   processing_next_attempt_at=clock_timestamp() + interval '15 seconds',
+                   processing_attempts=greatest(processing_attempts - 1, 0),
+                   last_processing_error=$3
+               WHERE id=$1 AND processing_state='processing' AND processing_lease_until=$2""",
+            media_id, lease, reason,
+        )
 
     async def mark_video_ready(
         self, connection: Connection, media_id: int, *, lease: datetime,
@@ -504,14 +503,104 @@ class MediaRepository:
         row = await self._postgres_pool.fetchrow(CLAIM_CLEANUP_TASK_SQL, lease_duration)
         if row is None:
             return None
-        return MediaCleanupTask(row["id"], row["relative_path"], row["attempts"])
+        return MediaCleanupTask(
+            row["id"], row["relative_path"], row["attempts"], row["lease_until"], row["owner_path"],
+        )
 
-    async def complete_cleanup_task(self, task_id: int) -> None:
+    async def complete_cleanup_task(self, task: MediaCleanupTask) -> None:
         """пометить задачу физической очистки завершённой"""
 
-        await self._postgres_pool.execute(COMPLETE_CLEANUP_TASK_SQL, task_id)
+        async with self.transaction() as connection:
+            completed = await connection.fetchval(
+                """UPDATE media_cleanup_tasks SET completed_at=clock_timestamp(),
+                       lease_until=NULL, last_error=NULL, next_attempt_at=NULL
+                   WHERE id=$1 AND lease_until=$2 AND completed_at IS NULL RETURNING true""",
+                task.id, task.lease_until,
+            )
+            if not completed:
+                return
+            await connection.execute(
+                """UPDATE media_disk_files
+                   SET work_paths=array_remove(work_paths, $1)
+                   WHERE path=$2 AND $1=ANY(work_paths)""",
+                task.relative_path, task.owner_path,
+            )
+            await connection.execute(
+                """UPDATE media_disk_files SET bytes=0 WHERE path=$1""", task.relative_path,
+            )
+            await connection.execute(
+                """DELETE FROM media_disk_files AS disk WHERE path IN ($1, $2)
+                     AND disk.bytes=0 AND cardinality(disk.work_paths)=0
+                     AND (disk.path=$1 OR NOT EXISTS (
+                         SELECT 1 FROM media WHERE id=disk.media_id
+                     ))""",
+                task.relative_path, task.owner_path,
+            )
+            await connection.execute(
+                """UPDATE media_disk_files AS disk SET work_bytes=0 FROM media
+                   WHERE disk.path=$1 AND disk.media_id=media.id
+                     AND media.processing_state='failed' AND cardinality(disk.work_paths)=0""",
+                task.owner_path,
+            )
 
-    async def fail_cleanup_task(self, task_id: int, error: str) -> None:
+    async def fail_cleanup_task(self, task: MediaCleanupTask, error: str) -> None:
         """сохранить ошибку и вернуть задачу следующему безопасному запуску"""
 
-        await self._postgres_pool.execute(FAIL_CLEANUP_TASK_SQL, task_id, error[:1_000])
+        await self._postgres_pool.execute(
+            FAIL_CLEANUP_TASK_SQL, task.id, task.lease_until, error[:1_000],
+        )
+
+    async def queue_expired_uploads(self) -> None:
+        """добавить записи для карантина, оставленного процессом upload"""
+
+        await self._postgres_pool.execute(
+            """INSERT INTO media_cleanup_tasks (relative_path, quota_owner_path)
+               SELECT path, owner_path FROM media_disk_files
+               WHERE expires_at <= clock_timestamp()
+               ON CONFLICT (relative_path) DO NOTHING"""
+        )
+
+    async def queue_failed_derivatives(self) -> None:
+        """убрать временные файлы терминальных задач и вернуть неиспользуемый резерв"""
+
+        async with self.transaction() as connection:
+            await connection.execute(
+                """INSERT INTO media_cleanup_tasks (relative_path, quota_owner_path)
+                   SELECT unnest(disk.work_paths), disk.owner_path FROM media_disk_files disk
+                   JOIN media ON media.id=disk.media_id AND media.processing_state='failed'
+                   ON CONFLICT (relative_path) DO UPDATE SET
+                       quota_owner_path=EXCLUDED.quota_owner_path,
+                       completed_at=NULL, lease_until=NULL, next_attempt_at=NULL, last_error=NULL
+                   WHERE media_cleanup_tasks.completed_at IS NOT NULL"""
+            )
+            await connection.execute(
+                """UPDATE media_disk_files disk SET work_bytes=0 FROM media
+                   WHERE media.id=disk.media_id AND media.processing_state='failed'
+                     AND disk.work_bytes>0 AND cardinality(disk.work_paths)=0"""
+            )
+
+    async def cleanup_still_allowed(self, task: MediaCleanupTask) -> bool:
+        """проверить захват очистки и убедиться, что путь больше не нужен media"""
+
+        return bool(await self._postgres_pool.fetchval(
+            """SELECT EXISTS (
+                   SELECT 1 FROM media_cleanup_tasks
+                   WHERE id=$2 AND lease_until=$3 AND completed_at IS NULL
+               ) AND NOT EXISTS (
+                   SELECT 1 FROM media_disk_files AS disk LEFT JOIN media ON media.id=disk.media_id
+                   WHERE (disk.path=$1 AND (NOT disk.managed
+                         OR (media.id IS NOT NULL
+                             AND (media.path<>disk.path OR media.processing_state<>'ready'))))
+                      OR ($1=ANY(disk.work_paths)
+                          AND media.processing_state IN ('queued', 'processing'))
+               )""",
+            task.relative_path, task.id, task.lease_until,
+        ))
+
+    async def cancel_cleanup_task(self, task: MediaCleanupTask) -> None:
+        """отменить просроченную задачу, путь которой теперь принадлежит media"""
+
+        await self._postgres_pool.execute(
+            """DELETE FROM media_cleanup_tasks WHERE id=$1 AND lease_until=$2""",
+            task.id, task.lease_until,
+        )

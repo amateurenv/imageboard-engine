@@ -1,8 +1,8 @@
 [Unit]
-Description=Run Imageboard cleanup every hour
+Description=Run Imageboard cleanup every five minutes
 
 [Timer]
-OnCalendar=hourly
+OnCalendar=*:0/5
 Persistent=true
 
 [Install]

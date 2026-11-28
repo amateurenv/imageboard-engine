@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Literal, Self
 
 # BaseSettings читает переменные окружения, SettingsConfigDict задаёт правила
-from pydantic import PostgresDsn, RedisDsn, model_validator
+from pydantic import Field, PostgresDsn, RedisDsn, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -32,6 +32,13 @@ class Settings(BaseSettings):
 
     # корень закрытого media storage, не подключать к static или reverse proxy на этом этапе
     media_storage_root: Path = Path("media")
+    media_storage_max_bytes: int = Field(default=8 * 1024**3, gt=0, le=2**63 - 1)
+    media_storage_min_free_bytes: int = Field(default=256 * 1024**2, gt=0, le=2**63 - 1)
+    media_upload_max_file_bytes: int = Field(
+        default=20 * 1024**2, ge=1024**2, le=100 * 1024**2
+    )
+    media_upload_concurrency: int = Field(default=4, ge=1, le=64)
+    media_upload_timeout_seconds: int = Field(default=120, ge=1, le=900)
 
     # имена бинарников задаются оператором, но никогда не становятся частью shell-команды
     ffmpeg_bin: str = "ffmpeg"
@@ -44,7 +51,30 @@ class Settings(BaseSettings):
         # traceback не должен попасть в ответ реальному посетителю
         if self.app_env == "production" and self.app_debug:
             raise ValueError("APP_DEBUG must be false when APP_ENV=production")
+        if self.media_storage_max_bytes <= self.media_ingress_budget:
+            raise ValueError("MEDIA_STORAGE_MAX_BYTES must exceed the multipart budget")
+        if self.app_env == "production" and not self.media_storage_root.is_absolute():
+            raise ValueError("MEDIA_STORAGE_ROOT must be an absolute mount path in production")
         return self
+
+    @property
+    def media_upload_body_bytes(self) -> int:
+        """верхняя граница тела с запасом на multipart"""
+
+        return self.media_upload_max_file_bytes + 64 * 1024
+
+    @property
+    def media_ingress_budget(self) -> int:
+        """доля квоты для всех одновременно открытых multipart файлов"""
+
+        blocks = 64 * 1024 * (self.media_upload_body_bytes // (1024**2) + 1)
+        return self.media_upload_concurrency * (self.media_upload_body_bytes + blocks)
+
+    @property
+    def media_ingress_file_slots(self) -> int:
+        """максимум файлов multipart, которые могут перейти из памяти на диск"""
+
+        return self.media_upload_concurrency * (self.media_upload_body_bytes // (1024**2) + 1)
 
     # правила чтения настроек
     model_config = SettingsConfigDict(

@@ -2,12 +2,24 @@
 
 import json
 import math
+import signal
 import subprocess
+import sys
 
 from app.services.media_policy import MediaPolicy, MediaPolicyCode, MediaPolicyError
+from app.services.media_quota import MediaOutputTooLarge, MediaStorageFull
+from app.services.media_storage import writer_fds
 
 PROBE_TIMEOUT_SECONDS = 10
 TRANSCODE_TIMEOUT_SECONDS = 120
+
+
+def bounded_output(arguments: list[str], max_bytes: int) -> list[str]:
+    """ограничить запись файла системным лимитом кодировщика"""
+
+    if sys.platform == "linux" and writer_fds():
+        return ["/usr/bin/prlimit", f"--fsize={max_bytes}:{max_bytes}", "--", *arguments]
+    return arguments
 
 
 def run_ffmpeg(arguments: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
@@ -23,6 +35,7 @@ def run_ffmpeg(arguments: list[str], timeout: int) -> subprocess.CompletedProces
             errors="replace",
             timeout=timeout,
             check=False,
+            pass_fds=writer_fds(),
         )
     except FileNotFoundError as error:
         raise MediaPolicyError(
@@ -33,6 +46,13 @@ def run_ffmpeg(arguments: list[str], timeout: int) -> subprocess.CompletedProces
     except subprocess.TimeoutExpired as error:
         raise MediaPolicy.invalid_media("превышено время безопасной обработки медиа") from error
     if completed.returncode != 0:
+        if completed.returncode == -getattr(signal, "SIGXFSZ", 25):
+            raise MediaOutputTooLarge("encoded file exceeds its size limit")
+        if any(
+            message in completed.stderr
+            for message in ("No space left on device", "Disk quota exceeded")
+        ):
+            raise MediaStorageFull("media filesystem refused encoder output")
         raise MediaPolicy.invalid_media("FFmpeg/FFprobe не смог обработать медиа")
     return completed
 

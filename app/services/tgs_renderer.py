@@ -1,6 +1,7 @@
 """изолированный linux-процесс для одного кадра из проверенного Lottie JSON"""
 
 import ctypes
+import errno
 import resource
 import sys
 from array import array
@@ -79,7 +80,13 @@ def main() -> int:
     data = sys.stdin.buffer.read(MAX_INPUT + 1)
     if len(data) > MAX_INPUT:
         return 1
-    _render(library, data, sys.stdout.buffer)
+    try:
+        with open(sys.stdout.fileno(), "wb", buffering=0, closefd=False) as output:
+            _render(library, data, output)
+    except OSError as error:
+        if error.errno in {errno.ENOSPC, errno.EDQUOT}:
+            return 3
+        raise
     return 0
 
 

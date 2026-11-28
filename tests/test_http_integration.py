@@ -1,11 +1,13 @@
 """сквозная проверка http api с настоящими postgresql и redis"""
 
 import asyncio
+import errno
 import json
 import os
 import shutil
 import socket
 import subprocess
+import tempfile
 import uuid
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -32,6 +34,7 @@ from app.repositories.media import MediaRepository
 from app.repositories.posting_claims import PostingClaimsRepository
 from app.repositories.users import UsersRepository
 from app.services.media_policy import MEBIBYTE, MediaPolicyError, MediaType
+from app.services.media_quota import MediaQuota, MediaStorageFull, reserved_bytes, work_budget
 from app.services.media_storage import MediaStorage
 from app.services.media_upload import MediaUploadService
 from app.services.posting_claims import (
@@ -45,10 +48,21 @@ from app.services.video_processing import VideoProcessor
 from app.services.video_sticker_processing import WEBM_STICKER_MIME
 from app.ws.manager import DisabledWebSocketManager
 from scripts.cleanup_media_files import cleanup_media_files
+from scripts.inventory_media_storage import inventory_media_storage
 from scripts.media_worker import MAX_PROCESSING_ATTEMPTS, PROCESSING_LEASE, process_job
 
 pytestmark = pytest.mark.integration
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def media_files(storage: MediaStorage) -> list[Path]:
+    """вернуть файлы загрузок и производных без служебных блокировок"""
+
+    return [
+        path for path in storage.root.rglob("*")
+        if path.is_file()
+        and path.relative_to(storage.root).parts[0] not in {".locks", ".volume-id"}
+    ]
 
 
 @asynccontextmanager
@@ -171,7 +185,7 @@ async def test_internal_sticker_publication_visibility_and_cleanup(
         assert invalid.value.code.value == "invalid_media"
         assert await pool.fetchval("SELECT count(*) FROM posting_claims") == 0
         assert await pool.fetchval("SELECT count(*) FROM media") == 0
-        assert not [file for file in storage.root.rglob("*") if file.is_file()]
+        assert not media_files(storage)
 
     token, queued = await upload.stage_sticker(thread_id=thread_id, actor=author, data=payload)
     assert queued.media_kind == "sticker" and queued.processing_state.value == "queued"
@@ -409,14 +423,18 @@ async def test_sticker_worker_replace_failure_keeps_quarantine_until_claim_expir
     media = await repository.get_by_id(queued.id)
     assert media is not None and media.processing_state.value == "processing"
     assert (media.display_path, media.canonical_path, media.preview_path) == (None, None, None)
-    assert list(storage.root.rglob("*.*")) == [storage.resolve(media.path)]
+    assert media_files(storage) == [storage.resolve(media.path)]
     assert await cleanup_media_files(repository=repository, storage=storage) == 0
     animated = extension != "webp"
     path = f"stickers/{queued.id}.{extension}" if animated else f"display/{queued.id}.webp"
     if extension == "webm":
-        # имитируем остановку worker после replace, когда пути ещё отсутствуют в базе
-        for derivative in (path, f"previews/{queued.id}.webp"):
-            storage.resolve(derivative).write_bytes(b"interrupted worker")
+        # имитируем остановку worker после replace и до ready commit
+        derivatives = [path, f"previews/{queued.id}.webp"]
+        await pool.execute(
+            "UPDATE media_disk_files SET work_paths=$1 WHERE path=$2", derivatives, media.path,
+        )
+        for derivative in derivatives:
+            storage.prepare_parent(derivative).write_bytes(b"interrupted worker")
     else:
         await process_job(
             repository, queued.id, storage, expected_lease=claimed.processing_lease_until,
@@ -431,11 +449,13 @@ async def test_sticker_worker_replace_failure_keeps_quarantine_until_claim_expir
     assert await repository.get_by_id(queued.id) is None
     cleanup_count = await cleanup_media_files(repository=repository, storage=storage)
     assert cleanup_count == (3 if animated else 2)
-    assert not [file for file in storage.root.rglob("*") if file.is_file()]
+    assert not media_files(storage)
 
 
 @pytest.fixture
-async def http_client(tmp_path: Path, request: pytest.FixtureRequest) -> AsyncClient:
+async def http_client(
+    tmp_path: Path, request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch,
+) -> AsyncClient:
     """дать api отдельные postgres-схему и redis database"""
 
     database_url = os.getenv("TEST_DATABASE_URL")
@@ -453,10 +473,15 @@ async def http_client(tmp_path: Path, request: pytest.FixtureRequest) -> AsyncCl
         await redis.delete(*stale_keys)
     await connection.execute(f'CREATE SCHEMA "{schema}"')
     await connection.execute(f'SET search_path TO "{schema}"')
-    max_migration = getattr(request, "param", None)
+    requested_schema = getattr(request, "param", None)
+    before_quota = requested_schema == "before-quota"
+    max_migration = 24 if before_quota else (
+        requested_schema if isinstance(requested_schema, int) else None
+    )
     for migration in sorted((PROJECT_ROOT / "migrations").glob("*.sql")):
-        if max_migration is not None and int(migration.name.split("_", 1)[0]) > max_migration:
-            break
+        number = int(migration.name.split("_", 1)[0])
+        if max_migration is not None and number > max_migration and (number != 25 or before_quota):
+            continue
         await connection.execute(migration.read_text(encoding="utf-8"))
 
     pool = await asyncpg.create_pool(database_url, server_settings={"search_path": schema})
@@ -469,7 +494,13 @@ async def http_client(tmp_path: Path, request: pytest.FixtureRequest) -> AsyncCl
     app.state.postgres_pool = pool
     app.state.redis_client = redis
     app.state.site_settings = settings
-    app.state.media_storage_root = tmp_path / "media"
+    test_mount = os.getenv("TEST_MEDIA_QUOTA_MOUNT") if requested_schema == "small-volume" else None
+    app.state.media_storage_root = Path(test_mount) if test_mount else tmp_path / "media"
+    storage = MediaStorage(app.state.media_storage_root)
+    monkeypatch.setattr(app.state, "media_quota", MediaQuota(pool, storage), raising=False)
+    if not before_quota:
+        await inventory_media_storage(app.state.media_quota)
+    monkeypatch.setattr(tempfile, "tempdir", str(storage.prepare_parent(".spool/ready").parent))
     app.state.ws_manager = DisabledWebSocketManager()
     app.dependency_overrides = {
         get_postgres_pool: lambda: pool,
@@ -1193,6 +1224,7 @@ async def test_image_upload_quarantine_worker_attach_and_cleanup(http_client: As
         assert ready.display_path is not None and ready.preview_path is not None
         assert storage.resolve(ready.display_path).is_file()
         assert storage.resolve(ready.preview_path).is_file()
+        assert await cleanup_media_files(repository=repository, storage=storage) == 1
         assert not quarantine_path.exists()
 
     created = await http_client.post(
@@ -1225,7 +1257,294 @@ async def test_image_upload_quarantine_worker_attach_and_cleanup(http_client: As
     assert (await http_client.get(post_media[0]["display_url"])).status_code == 404
     assert await app.state.postgres_pool.fetchval("SELECT count(*) FROM media") == 0
     await cleanup_media_files(repository=repository, storage=storage)
-    assert not [path for path in storage.root.rglob("*") if path.is_file()]
+    assert not media_files(storage)
+
+
+@pytest.mark.anyio
+async def test_parallel_media_upload_reserves_work_before_acceptance(
+    http_client: AsyncClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """две загрузки не получают один резерв, а worker использует уже выделенное место"""
+
+    csrf = await login(http_client, "owner", "owner-password")
+    board = await http_client.post(
+        "/api/v1/admin/boards", headers=csrf, json={"slug": "quota", "title": "Quota"},
+    )
+    assert board.status_code == 200
+    claim = await http_client.post("/api/v1/boards/quota/posting-claims")
+    token = claim.json()["token"]
+    quota = app.state.media_quota
+    payload = image_bytes("PNG")
+    work = work_budget("image", "image/png", False)
+    quota.settings = quota.settings.model_copy(update={
+        "media_storage_max_bytes": quota.settings.media_ingress_budget
+        + 2 * reserved_bytes(len(payload)) + work,
+    })
+
+    async def upload() -> Response:
+        return await http_client.post(
+            "/api/v1/boards/quota/media", data={"posting_claim_token": token},
+            files={"file": ("image.png", payload, "image/png")},
+        )
+
+    responses = sorted(await asyncio.gather(upload(), upload()), key=lambda r: r.status_code)
+    accepted, rejected = responses
+    assert accepted.status_code == 201, accepted.text
+    assert rejected.status_code == 503, rejected.text
+    assert rejected.json()["detail"]["code"] == "media_storage_full"
+    assert len(media_files(quota.storage)) == 1
+    media_id = accepted.json()["id"]
+    assert await quota.pool.fetchval(
+        "SELECT work_bytes FROM media_disk_files WHERE media_id=$1", media_id,
+    ) == work
+    repository = MediaRepository(quota.pool)
+    claimed = await repository.claim_by_id(
+        media_id, max_attempts=MAX_PROCESSING_ATTEMPTS, lease_duration=PROCESSING_LEASE,
+    )
+    assert claimed is not None
+    with monkeypatch.context() as patch:
+        patch.setattr(MediaQuota, "free_bytes", lambda _: 0)
+        with pytest.raises(MediaStorageFull):
+            await process_job(repository, media_id, quota.storage)
+    await repository.defer_processing(
+        media_id, claimed.processing_lease_until, "media_storage_full",
+    )
+    deferred = await repository.get_by_id(media_id)
+    assert deferred is not None and deferred.processing_attempts == 0
+    assert deferred.processing_state.value == "queued"
+    assert quota.storage.resolve(deferred.path).is_file()
+    assert await repository.claim_by_id(
+        media_id, max_attempts=MAX_PROCESSING_ATTEMPTS, lease_duration=PROCESSING_LEASE,
+    ) is None
+    await quota.pool.execute(
+        "UPDATE media SET processing_next_attempt_at=clock_timestamp() WHERE id=$1", media_id,
+    )
+    claimed = await repository.claim_by_id(
+        media_id, max_attempts=MAX_PROCESSING_ATTEMPTS, lease_duration=PROCESSING_LEASE,
+    )
+    assert claimed is not None
+    await process_job(
+        repository, media_id, quota.storage, expected_lease=claimed.processing_lease_until,
+    )
+    ready = await repository.get_by_id(media_id)
+    assert ready is not None and ready.processing_state.value == "ready"
+    assert ready.display_path is not None
+    await repository.delete(media_id)
+    quota.storage.delete_file(ready.display_path)
+    assert (await upload()).status_code == 503
+    assert await cleanup_media_files(repository=repository, storage=quota.storage) == 3
+    assert await cleanup_media_files(repository=repository, storage=quota.storage) == 0
+    assert await quota.pool.fetchval("SELECT count(*) FROM media_disk_files") == 0
+    assert (await upload()).status_code == 201
+
+
+@pytest.mark.anyio
+async def test_media_quota_promotes_materialized_source_at_free_space_boundary(
+    http_client: AsyncClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """проверка свободных блоков не списывает записанный исходник повторно"""
+
+    quota = app.state.media_quota
+    path = quota.storage.new_quarantine_path(".upload")
+    payload = image_bytes("PNG")
+    await quota.reserve_source(path, len(payload))
+    quota.storage.prepare_parent(path).write_bytes(payload)
+    work = work_budget("image", "image/png", False)
+    floor = quota.settings.media_storage_min_free_bytes + quota.settings.media_ingress_budget
+    available = floor + work - 1
+    monkeypatch.setattr(quota, "free_bytes", lambda: available)
+    async with quota.transaction() as connection:
+        with pytest.raises(MediaStorageFull):
+            await quota.promote_source(connection, path, media_id=1, size=len(payload), work=work)
+        available += 1
+        await quota.promote_source(connection, path, media_id=1, size=len(payload), work=work)
+    row = await quota.pool.fetchrow("SELECT * FROM media_disk_files WHERE path=$1", path)
+    assert row["bytes"] == reserved_bytes(len(payload))
+    assert row["work_bytes"] == work and row["expires_at"] is None
+
+
+@pytest.mark.anyio
+async def test_media_quota_cleans_reused_derivative_after_second_worker_crash(
+    http_client: AsyncClient,
+) -> None:
+    """два исчерпанных lease на одном конечном пути освобождают оба резерва"""
+
+    quota = app.state.media_quota
+    repository = MediaRepository(quota.pool)
+    source = quota.storage.new_quarantine_path(".upload")
+    payload = image_bytes("PNG")
+    work = work_budget("image", "image/png", False)
+    await quota.reserve_source(source, len(payload))
+    quota.storage.prepare_parent(source).write_bytes(payload)
+    media = await repository.create(path=source, size=len(payload), mime_type="image/png")
+    async with quota.transaction() as connection:
+        await quota.promote_source(
+            connection, source, media_id=media.id, size=len(payload), work=work,
+        )
+    final = f"display/{media.id}.webp"
+
+    for attempt in range(2):
+        claimed = await repository.claim_by_id(
+            media.id, max_attempts=1, lease_duration=timedelta(seconds=-1),
+        )
+        assert claimed is not None
+        async with quota.transaction() as connection:
+            if attempt:
+                await quota.admit(connection, work)
+            await quota.start_work(connection, source, work, [final])
+        quota.storage.prepare_parent(final).write_bytes(b"interrupted before ready")
+        recovered = await repository.recover_expired(max_attempts=1)
+        assert len(recovered) == 1 and recovered[0].processing_state.value == "failed"
+        assert await cleanup_media_files(repository=repository, storage=quota.storage) == 1
+        assert not quota.storage.resolve(final).exists()
+        assert quota.storage.resolve(source).read_bytes() == payload
+        assert await quota.pool.fetchval(
+            "SELECT work_bytes FROM media_disk_files WHERE path=$1", source,
+        ) == 0
+        if not attempt:
+            assert await repository.retry_failed(media.id) is not None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("http_client", ["before-quota"], indirect=True)
+async def test_media_quota_inventory_keeps_existing_files(http_client: AsyncClient) -> None:
+    """обновление 024 сохраняет известные и неизвестные файлы и возвращает место после cleanup"""
+
+    quota = app.state.media_quota
+    source = "quarantine/legacy.upload"
+    quota.storage.prepare_parent(source).write_bytes(b"existing source")
+    unknown = quota.storage.resolve("keep.bin")
+    unknown.write_bytes(b"unknown")
+    media_id = await quota.pool.fetchval(
+        "INSERT INTO media(path,size,mime_type) VALUES ($1,15,'image/png') RETURNING id", source,
+    )
+    migration = PROJECT_ROOT / "migrations/025_media_disk_quota.sql"
+    await quota.pool.execute(migration.read_text(encoding="utf-8"))
+    response = await http_client.post("/api/v1/boards/quota/media")
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "media_storage_full"
+    assert await inventory_media_storage(quota) == (2, 1, 0)
+    await quota.pool.execute(
+        "INSERT INTO media_cleanup_tasks (relative_path) VALUES ('keep.bin')",
+    )
+    assert await quota.pool.fetchval(
+        "SELECT work_bytes > 0 FROM media_disk_files WHERE media_id=$1", media_id,
+    )
+    stale = quota.storage.new_quarantine_path(".upload")
+    await quota.reserve_source(stale, 16)
+    quota.storage.prepare_parent(stale).write_bytes(b"stale")
+    await quota.pool.execute(
+        "UPDATE media_disk_files SET expires_at=clock_timestamp() WHERE path=$1", stale,
+    )
+    repository = MediaRepository(quota.pool)
+    assert await cleanup_media_files(repository=repository, storage=quota.storage) == 1
+    assert not quota.storage.resolve(stale).exists()
+    assert quota.storage.resolve(source).read_bytes() == b"existing source"
+    assert unknown.read_bytes() == b"unknown"
+    assert await quota.pool.fetchval("SELECT count(*) FROM media_disk_files") == 2
+    unknown.unlink()
+    await inventory_media_storage(quota, reconcile=True)
+    assert await quota.pool.fetchval("SELECT count(*) FROM media_disk_files") == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("http_client", ["small-volume"], indirect=True)
+async def test_media_quota_returns_503_on_low_space_or_write_failure(
+    http_client: AsyncClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """переполнение не оставляет частичной загрузки и не отнимает запись после очистки"""
+
+    csrf = await login(http_client, "owner", "owner-password")
+    assert (await http_client.post(
+        "/api/v1/admin/boards", headers=csrf, json={"slug": "disk", "title": "Disk"},
+    )).status_code == 200
+    claim = await http_client.post("/api/v1/boards/disk/posting-claims")
+    token = claim.json()["token"]
+    quota = app.state.media_quota
+    quota.settings = quota.settings.model_copy(update={
+        "media_storage_min_free_bytes": 2 * MEBIBYTE,
+        "media_upload_max_file_bytes": 2 * MEBIBYTE,
+        "media_upload_concurrency": 1,
+    })
+
+    async def upload() -> Response:
+        return await http_client.post(
+            "/api/v1/boards/disk/media", data={"posting_claim_token": token},
+            files={"file": ("image.png", image_bytes("PNG"), "image/png")},
+        )
+
+    if os.getenv("TEST_MEDIA_QUOTA_MOUNT"):
+        assert quota.storage.root.is_mount()
+        quota.settings = quota.settings.model_copy(update={"app_env": "production"})
+        space = quota.free_bytes()
+        assert 0 < space <= 64 * MEBIBYTE
+        filler = quota.storage.resolve("test-fill")
+        try:
+            with filler.open("xb") as output:
+                with pytest.raises(OSError) as kernel_error:
+                    os.posix_fallocate(output.fileno(), 0, space + MEBIBYTE)
+                assert kernel_error.value.errno == errno.ENOSPC
+                output.truncate(0)
+                os.posix_fallocate(output.fileno(), 0, space - MEBIBYTE)
+                rejected = await upload()
+        finally:
+            filler.unlink(missing_ok=True)
+    else:
+        def fail_sync(_: Path) -> None:
+            raise OSError(errno.ENOSPC, "disk is full")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(quota.storage, "sync_file", fail_sync)
+            rejected = await upload()
+    assert rejected.status_code == 503, rejected.text
+    assert rejected.json()["detail"]["code"] == "media_storage_full"
+    assert await quota.pool.fetchval("SELECT count(*) FROM media_disk_files") == 0
+    assert not media_files(quota.storage)
+    assert (await upload()).status_code == 201
+
+
+@pytest.mark.anyio
+async def test_media_upload_through_nginx_with_chunked_body(
+    http_client: AsyncClient, tmp_path: Path,
+) -> None:
+    """передать multipart без content-length через настоящий reverse proxy"""
+
+    nginx = shutil.which("nginx")
+    if nginx is None:
+        pytest.skip("Nginx is required")
+    csrf = await login(http_client, "owner", "owner-password")
+    assert (await http_client.post(
+        "/api/v1/admin/boards", headers=csrf, json={"slug": "chunked", "title": "Chunked"},
+    )).status_code == 200
+    quota = app.state.media_quota
+    async with nginx_client(nginx, quota.storage.root, tmp_path) as proxy:
+        claim = await proxy.post("/api/v1/boards/chunked/posting-claims")
+        assert claim.status_code == 201, claim.text
+        token = claim.json()["token"].encode()
+        body = (
+            b'--quota\r\nContent-Disposition: form-data; name="posting_claim_token"\r\n\r\n'
+            + token
+            + b'\r\n--quota\r\nContent-Disposition: form-data; name="file"; filename="test.jpg"\r\n'
+            + b'Content-Type: image/jpeg\r\n\r\n'
+        )
+
+        async def stream(padding: bytes):
+            yield body
+            yield image_bytes("JPEG") + padding
+            yield b"\r\n--quota--\r\n"
+
+        headers = {"Content-Type": "multipart/form-data; boundary=quota"}
+        uploaded = await proxy.post(
+            "/api/v1/boards/chunked/media", content=stream(b""), headers=headers,
+        )
+        assert uploaded.status_code == 201, uploaded.text
+        quota.settings = quota.settings.model_copy(update={"media_upload_max_file_bytes": 512})
+        rejected = await proxy.post(
+            "/api/v1/boards/chunked/media", content=stream(b"x" * 65536), headers=headers,
+        )
+        assert rejected.status_code == 413, rejected.text
+        assert rejected.json()["detail"]["code"] == "media_file_too_large"
+        assert not any(path.is_file() for path in (quota.storage.root / ".nginx-body").rglob("*"))
 
 
 @pytest.mark.anyio
@@ -1403,6 +1722,7 @@ async def test_real_ffmpeg_audio_upload_worker_attach_and_delivery(
         actual_containers, actual_codec = probe_audio(storage.resolve(ready.canonical_path))
         assert expected[0] in actual_containers
         assert actual_codec == expected[1]
+        assert await cleanup_media_files(repository=repository, storage=storage) == 1
         assert not quarantine_path.exists()
 
     created = await http_client.post(
@@ -1643,7 +1963,7 @@ async def test_video_upload_worker_visibility_and_cleanup(
             assert hidden_asset.headers["cache-control"] == "no-store"
     assert (await http_client.delete(path, headers=csrf)).status_code == 204
     assert await cleanup_media_files(repository=repository, storage=storage) == 4
-    assert not [f for f in storage.root.rglob("*") if f.is_file()]
+    assert not media_files(storage)
 
 
 @pytest.mark.anyio
@@ -1755,7 +2075,7 @@ async def test_video_worker_retries_corrupt_samples_without_leaving_derivatives(
         lease=claimed.processing_lease_until,
     )
     assert retry is not None and retry.processing_state.value == "queued"
-    assert [p for p in storage.root.rglob("*") if p.is_file()] == [original]
+    assert media_files(storage) == [original]
 
     original.write_bytes(payload)
     claimed = await repository.claim_by_id(
@@ -1805,7 +2125,7 @@ async def test_video_preview_replace_failure_rolls_back_ready_and_cleanup(
     assert processing is not None and processing.processing_state.value == "processing"
     assert processing.canonical_path is None and processing.preview_path is None
     assert await cleanup_media_files(repository=repository, storage=storage) == 0
-    assert [path for path in storage.root.rglob("*") if path.is_file()] == [original]
+    assert media_files(storage) == [original]
     retry = await repository.fail_processing(
         media_id, max_attempts=MAX_PROCESSING_ATTEMPTS, error="preview replace failed",
         lease=claimed.processing_lease_until,
@@ -1840,19 +2160,26 @@ async def test_video_note_worker_requires_current_lease_and_public_claim_cannot_
     storage = MediaStorage(app.state.media_storage_root)
     data = make_video_file(tmp_path / "square.mp4", size="160x160")
     relative_path = storage.new_quarantine_path(".mp4")
+    quota = MediaQuota(pool, storage)
+    await quota.reserve_source(relative_path, len(data))
     original = storage.prepare_parent(relative_path)
     original.write_bytes(data)
     note = await repository.create(
         path=relative_path, size=len(data), mime_type="video/mp4", media_kind="video_note",
         board_id=stored_claim.board_id, posting_claim_id=stored_claim.id, duration_seconds=1,
     )
+    async with quota.transaction() as connection:
+        await quota.promote_source(
+            connection, relative_path, media_id=note.id, size=len(data),
+            work=work_budget(note.media_kind, note.mime_type, note.is_animation),
+        )
     stale = await repository.claim_by_id(
         note.id, max_attempts=MAX_PROCESSING_ATTEMPTS, lease_duration=timedelta(seconds=-1),
     )
     assert stale is not None
     with pytest.raises(RuntimeError, match="lease was lost"):
         await process_job(repository, note.id, storage)
-    assert [p for p in storage.root.rglob("*") if p.is_file()] == [original]
+    assert media_files(storage) == [original]
     assert await repository.recover_expired(max_attempts=MAX_PROCESSING_ATTEMPTS)
 
     current = await repository.claim_by_id(
@@ -1896,4 +2223,4 @@ async def test_video_note_worker_requires_current_lease_and_public_claim_cannot_
 
     await repository.delete(note.id)
     assert await cleanup_media_files(repository=repository, storage=storage) == 3
-    assert not [f for f in storage.root.rglob("*") if f.is_file()]
+    assert not media_files(storage)
