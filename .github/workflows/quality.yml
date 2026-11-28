@@ -6,7 +6,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       DATABASE_URL: postgresql://imageboard_app:change-me@localhost:5432/imageboard_test
       REDIS_URL: redis://localhost:6379/0
@@ -39,7 +39,7 @@ jobs:
           python-version: "3.14"
 
       - name: Install media dependencies
-        run: sudo apt-get update && sudo apt-get install --yes ffmpeg librlottie0-1
+        run: sudo apt-get update && sudo apt-get install --yes ffmpeg librlottie0-1 util-linux
 
       - name: Install dependencies
         run: |

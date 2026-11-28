@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from app.services import tgs_processing
 from app.services.media_policy import MediaPolicyCode, MediaPolicyError
 from app.services.tgs_processing import (
     MAX_JSON_BYTES,
@@ -67,13 +68,50 @@ def test_tgs_rejects_ambiguous_or_excessively_nested_json(document: bytes) -> No
         canonicalize_tgs(gzip.compress(document))
 
 
+def test_tgs_counts_discarded_metadata_towards_json_limits(tgs_document: dict) -> None:
+    tgs_document["meta"] = [0] * tgs_processing.MAX_JSON_NODES
+    with pytest.raises(MediaPolicyError, match="JSON complexity limit"):
+        canonicalize_tgs(encode(tgs_document))
+    nested: list = []
+    for _ in range(tgs_processing.MAX_JSON_DEPTH):
+        nested = [nested]
+    tgs_document["meta"] = nested
+    with pytest.raises(MediaPolicyError, match="JSON complexity limit"):
+        canonicalize_tgs(encode(tgs_document))
+
+
+def test_tgs_rejects_control_characters_in_property_names(tgs_document: dict) -> None:
+    tgs_document["layers"][0]["ty\x00suffix"] = 0
+    with pytest.raises(MediaPolicyError, match="invalid Lottie property name"):
+        canonicalize_tgs(encode(tgs_document))
+
+
+@pytest.mark.parametrize("kind", [3, 4])
+def test_tgs_rejects_composition_references_on_other_layer_types(
+    tgs_document: dict, kind: int,
+) -> None:
+    layer = tgs_document["layers"][0]
+    if kind == 3:
+        del layer["shapes"]
+    layer.update(ty=kind, refId="vector")
+    tgs_document["assets"] = [{"id": "vector", "layers": []}]
+    with pytest.raises(MediaPolicyError, match="property does not match layer type"):
+        canonicalize_tgs(encode(tgs_document))
+
+
+def test_tgs_rejects_shapes_on_null_layer(tgs_document: dict) -> None:
+    tgs_document["layers"][0]["ty"] = 3
+    with pytest.raises(MediaPolicyError, match="property does not match layer type"):
+        canonicalize_tgs(encode(tgs_document))
+
+
 def test_tgs_rejects_external_assets_expressions_and_cycles(tgs_document: dict) -> None:
     layer = tgs_document["layers"][0]
     invalid_layers = [
         {**layer, "ks": {"o": {"a": 0, "k": 50, "x": "expression"}}},
         {**layer, "shapes": [{"ty": "rp"}]},
         {**layer, "parent": 1},
-        {**layer, "ty": 0, "refId": "loop"},
+        {"ty": 0, "ind": 1, "refId": "loop"},
     ]
     for invalid in invalid_layers:
         tgs_document["layers"] = [invalid]
@@ -120,4 +158,39 @@ def test_tgs_renderer_timeout_preserves_no_canonical_output(
     monkeypatch.setattr(subprocess, "run", timeout)
     with pytest.raises(MediaPolicyError, match="время рендера TGS"):
         transcode_tgs(source, target, preview)
-    assert not target.exists()
+    assert not target.exists() and not preview.exists()
+
+
+def test_tgs_renderer_failure_keeps_existing_target(
+    tgs_payload: bytes, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, target, preview = (tmp_path / name for name in ("source.tgs", "out.tgs", "out.webp"))
+    source.write_bytes(tgs_payload)
+    target.write_bytes(b"existing")
+    monkeypatch.setattr(tgs_processing, "_render_preview", lambda *args: None)
+
+    with pytest.raises(FileExistsError):
+        transcode_tgs(source, target, preview)
+
+    assert target.read_bytes() == b"existing"
+    assert not preview.exists()
+
+
+@pytest.mark.parametrize("dependency", ["prlimit", "rlottie"])
+def test_tgs_renderer_reports_unavailable_dependency(
+    tgs_payload: bytes, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dependency: str,
+) -> None:
+    source, target, preview = (tmp_path / name for name in ("source.tgs", "out.tgs", "out.webp"))
+    source.write_bytes(tgs_payload)
+
+    def unavailable(command, **_options):
+        if dependency == "prlimit":
+            raise FileNotFoundError(2, "No such file", command[0])
+        raise subprocess.CalledProcessError(2, command)
+
+    monkeypatch.setattr(subprocess, "run", unavailable)
+    with pytest.raises(MediaPolicyError, match=dependency) as error:
+        transcode_tgs(source, target, preview)
+
+    assert error.value.code is MediaPolicyCode.MEDIA_PROCESSING_UNAVAILABLE
+    assert not target.exists() and not preview.exists()

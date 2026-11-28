@@ -10,14 +10,16 @@ SIDE = 512
 MAX_INPUT = 1024 * 1024
 
 
-def _render(library: ctypes.CDLL, data: bytes, output: BinaryIO) -> None:
-    from PIL import Image
+def _bind(library: ctypes.CDLL) -> None:
+    """проверить наличие функций C API и задать размеры аргументов и указателей"""
 
     library.lottie_animation_from_data.argtypes = [ctypes.c_char_p] * 3
     library.lottie_animation_from_data.restype = ctypes.c_void_p
     library.lottie_animation_destroy.argtypes = [ctypes.c_void_p]
     library.lottie_animation_destroy.restype = None
-    library.lottie_animation_get_size.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    library.lottie_animation_get_size.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t),
+    ]
     library.lottie_animation_get_size.restype = None
     library.lottie_animation_get_totalframe.argtypes = [ctypes.c_void_p]
     library.lottie_animation_get_totalframe.restype = ctypes.c_size_t
@@ -26,6 +28,12 @@ def _render(library: ctypes.CDLL, data: bytes, output: BinaryIO) -> None:
         ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
     ]
     library.lottie_animation_render.restype = None
+
+
+def _render(library: ctypes.CDLL, data: bytes, output: BinaryIO) -> None:
+    """отрендерить начальный кадр в статический WebP с альфа-каналом"""
+
+    from PIL import Image
 
     animation = library.lottie_animation_from_data(data, b"", b"")
     if not animation:
@@ -62,8 +70,9 @@ def main() -> int:
     for soname in ("librlottie.so.0-1", "librlottie.so.0", "librlottie.so"):
         try:
             library = ctypes.CDLL(soname)
+            _bind(library)
             break
-        except OSError:
+        except (OSError, AttributeError):
             continue
     else:
         return 2

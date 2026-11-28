@@ -7,7 +7,7 @@ import subprocess
 import sys
 import zlib
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from app.services.media_policy import MediaPolicy, MediaPolicyCode, MediaPolicyError
 from app.services.sticker_processing import STICKER_SIDE
@@ -45,18 +45,27 @@ def _reject_constant(value: str) -> None:
 def _check_tree(document: dict[str, Any]) -> None:
     """ограничить дерево до обхода слоёв и исключить выражения и внешние ресурсы"""
 
-    pending = [(document, 0, "")]
+    pending = [(document, 0, "", False)]
     visited = 0
     while pending:
-        value, depth, key = pending.pop()
+        value, depth, key, metadata = pending.pop()
         visited += 1
         if visited > MAX_JSON_NODES or depth > MAX_JSON_DEPTH:
             raise ValueError("JSON complexity limit")
+        # отсечь широкий контейнер до добавления всех его потомков в стек
+        if isinstance(value, (dict, list)) and visited + len(pending) + len(value) > MAX_JSON_NODES:
+            raise ValueError("JSON complexity limit")
         if isinstance(value, dict):
-            for name in METADATA_KEYS:
-                value.pop(name, None)
+            if metadata:
+                pending.extend((child, depth + 1, "", True) for child in value.values())
+                continue
+            # нативный парсер сравнивает имена полей как строки с нулевым терминатором
+            if any(not name or not name.isascii() or not name.isprintable() for name in value):
+                raise ValueError("invalid Lottie property name")
+            for name in METADATA_KEYS.intersection(value):
+                pending.append((value.pop(name), depth + 1, name, True))
             if value.get("hasMask") is False:
-                value.pop("hasMask")
+                pending.append((value.pop("hasMask"), depth + 1, "hasMask", True))
             if FORBIDDEN_KEYS.intersection(value):
                 raise ValueError("unsupported Lottie property")
             if "ty" in value and type(value["ty"]) not in (int, str):
@@ -67,9 +76,11 @@ def _check_tree(document: dict[str, Any]) -> None:
             ordered = sorted(value.items(), key=lambda item: (item[0] != "ty", item[0]))
             value.clear()
             value.update(ordered)
-            pending.extend((child, depth + 1, name) for name, child in value.items())
+            pending.extend((child, depth + 1, name, False) for name, child in value.items())
         elif isinstance(value, list):
-            pending.extend((child, depth + 1, "") for child in value)
+            pending.extend((child, depth + 1, "", metadata) for child in value)
+        elif metadata:
+            continue
         elif isinstance(value, str):
             if (
                 key not in {"id", "refId", "ty", "v", "n"}
@@ -150,6 +161,9 @@ def _check_compositions(document: dict[str, Any]) -> None:
             if parent is not None and type(parent) is not int:
                 raise ValueError("invalid Lottie layer parent")
             parents[index] = parent
+            # rlottie читает refId и shapes независимо от типа слоя
+            if (kind != 0 and "refId" in layer) or (kind != 4 and "shapes" in layer):
+                raise ValueError("Lottie property does not match layer type")
             if kind == 4:
                 _check_shapes(layer.get("shapes"))
             if kind == 0:
@@ -239,18 +253,38 @@ def transcode_tgs(source: Path, target: Path, preview: Path) -> int:
 
     with source.open("rb") as original:
         clean, canonical, duration = canonicalize_tgs(original.read(MAX_TGS_BYTES + 1))
+    preview_created = target_created = False
     try:
         with preview.open("xb") as output:
-            subprocess.run(
-                # glibc берёт размер стека потоков из лимита на момент exec
-                [
-                    "/usr/bin/prlimit", "--stack=1048576:1048576", "--",
-                    sys.executable, "-I", str(Path(__file__).with_name("tgs_renderer.py")),
-                ],
-                input=clean, stdout=output, stderr=subprocess.DEVNULL,
-                env={"MALLOC_ARENA_MAX": "2"},
-                timeout=RENDER_TIMEOUT_SECONDS, check=True,
-            )
+            preview_created = True
+            _render_preview(clean, output)
+        with target.open("xb") as output:
+            target_created = True
+            output.write(canonical)
+    except BaseException:
+        # удалить только файлы, которые создал текущий запуск
+        if preview_created:
+            preview.unlink(missing_ok=True)
+        if target_created:
+            target.unlink(missing_ok=True)
+        raise
+    return duration
+
+
+def _render_preview(clean: bytes, output: BinaryIO) -> None:
+    """запустить рендер с ограниченным стеком потоков и временем выполнения"""
+
+    try:
+        subprocess.run(
+            # glibc берёт размер стека потоков из лимита на момент exec
+            [
+                "/usr/bin/prlimit", "--stack=1048576:1048576", "--",
+                sys.executable, "-I", str(Path(__file__).with_name("tgs_renderer.py")),
+            ],
+            input=clean, stdout=output, stderr=subprocess.DEVNULL,
+            env={"MALLOC_ARENA_MAX": "2"},
+            timeout=RENDER_TIMEOUT_SECONDS, check=True,
+        )
     except FileNotFoundError as error:
         if error.filename != "/usr/bin/prlimit":
             raise
@@ -265,9 +299,7 @@ def transcode_tgs(source: Path, target: Path, preview: Path) -> int:
         if error.returncode == 2:
             raise MediaPolicyError(
                 code=MediaPolicyCode.MEDIA_PROCESSING_UNAVAILABLE,
-                message="воркеру нужна системная библиотека rlottie",
+                message="воркеру нужна системная библиотека rlottie с совместимым C API",
                 http_status=503,
             ) from error
         raise MediaPolicy.invalid_media("не удалось отрендерить TGS") from error
-    target.write_bytes(canonical)
-    return duration
